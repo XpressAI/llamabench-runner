@@ -1,8 +1,12 @@
 # Release: cross-compile the runner and publish binaries to a GitHub Release.
 #
 # Triggered on pushing a tag like `v0.1.0`. Plain cargo per target — no cargo-dist, no
-# unified build tool. The asset names here MUST match the triple→asset mapping in the
-# installer (apps/web/static/install.sh in the llamabench.ai repo, served at
+# unified build tool. The matrix builds + uploads ARTIFACTS; a single final job collects
+# them and creates the Release in ONE call, so the jobs never race to create the release
+# (which is what dropped an asset on the first v0.1.0 run).
+#
+# Asset names MUST match the triple→asset mapping in the installer
+# (apps/web/static/install.sh in the llamabench.ai repo, served at
 # https://llamabench.ai/install.sh), or `curl … | sh` will 404.
 
 name: Release
@@ -12,7 +16,7 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write # softprops/action-gh-release creates/updates the Release for the tag.
+  contents: write # the release job creates/updates the Release for the tag.
 
 jobs:
   build:
@@ -51,22 +55,33 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          archive="llamabench-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C "target/${{ matrix.target }}/release" llamabench
-          echo "ASSET=$archive" >> "$GITHUB_ENV"
+        run: tar -czf "llamabench-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" llamabench
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $archive = "llamabench-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/llamabench.exe" -DestinationPath $archive
-          "ASSET=$archive" >> $env:GITHUB_ENV
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/llamabench.exe" -DestinationPath "llamabench-${{ matrix.target }}.zip"
 
-      - name: Upload to release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: llamabench-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: ${{ env.ASSET }}
+          files: dist/**/llamabench-*
           fail_on_unmatched_files: true
