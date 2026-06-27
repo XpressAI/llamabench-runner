@@ -1,0 +1,26 @@
+[package]
+name = "llamabench-runner"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Xpress AI <hello@xpress.ai>"]
+repository = "https://github.com/XpressAI/llamabench-runner"
+description = "llamabench.ai benchmark runner — detects hardware, drives the local inference stack (llama.cpp/vLLM/…), and submits a signed result."
+
+[[bin]]
+name = "llamabench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# localhost-only HTTP to the llama-server during verification; no TLS needed.
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
