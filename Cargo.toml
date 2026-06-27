@@ -1,6 +1,6 @@
 [package]
 name = "llamabench-runner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Xpress AI <hello@xpress.ai>"]
@@ -17,8 +17,18 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# localhost-only HTTP to the llama-server during verification; no TLS needed.
-ureq = { version = "2", default-features = false, features = ["json"] }
+# HTTP client. ureq 2's default features include the rustls TLS backend, which we
+# need to reach https:// (Hugging Face, GitHub, and submit to llamabench.ai) in
+# addition to the localhost llama-server.
+ureq = { version = "2", features = ["json"] }
+# Per-user config/cache locations (token store, model + llama.cpp download cache).
+dirs = "6"
+# Extract the prebuilt llama.cpp release archives. Windows ships .zip; macOS and
+# Linux ship .tar.gz — so we need both. All pure-Rust (deflate-only zip + flate2 +
+# tar), no C deps, so the release cross-builds cleanly.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
 
 [profile.release]
 strip = true
