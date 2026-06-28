@@ -59,6 +59,8 @@ struct AuthArgs {
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
 /// recorded under the variant's name so they stay comparable yet distinct.
+// They are all llama.cpp variants, so the shared "LlamaCpp" suffix is intentional.
+#[allow(clippy::enum_variant_names)]
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     /// Upstream ggml-org/llama.cpp (the default; the only one with prebuilt downloads).
