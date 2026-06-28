@@ -41,6 +41,12 @@ llamabench run --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M \
 # Or use a local model file:
 llamabench run --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/bin
 
+# Benchmarking a llama.cpp fork? Name it with --family so the result is recorded
+# under that engine (ik_llama.cpp, beellama.cpp, or Xpress AI's ve_llama.cpp for the
+# NEC Vector Engine). Forks have no prebuilt download — point --llama-dir at your build.
+llamabench run --model /path/to/model.gguf \
+  --family ik_llama.cpp --llama-dir /path/to/ik_llama.cpp/build/bin
+
 # Use a LOCAL file but attribute + hash-verify its Hugging Face provenance
 # (records the repo and a ✓/⚠ verified flag; the local bytes are what's benchmarked):
 llamabench run --model /path/to/Llama-3.1-8B-Instruct-Q4_K_M.gguf \
@@ -80,6 +86,13 @@ llamabench run --model /path/to/model.gguf --dry-run
   `--llama-dir` at it for full speed. With neither `--llama-dir` nor `--download-llama`,
   the runner uses `llama-bench`/`llama-server` from your `PATH`, and falls back to the
   prebuilt CPU/Metal build if they aren't found.
+- **`--family <llama.cpp|ik_llama.cpp|beellama.cpp|ve_llama.cpp>`** records which
+  llama.cpp variant the build is (default `llama.cpp`), so results from different engines
+  stay comparable but distinct on the leaderboard. The forks share the same
+  `llama-bench`/`llama-server` CLI, so the runner drives them identically — but only
+  upstream llama.cpp has prebuilt downloads, so build the fork and point `--llama-dir`
+  at it (or put its binaries on `PATH`). `ve_llama.cpp` is Xpress AI's fork adding NEC
+  SX-Aurora Vector Engine support.
 
 ### Token resolution
 

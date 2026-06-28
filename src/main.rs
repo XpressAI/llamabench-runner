@@ -17,7 +17,7 @@ mod download;
 mod verify;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -56,6 +56,37 @@ struct AuthArgs {
     token: Option<String>,
 }
 
+/// Which llama.cpp variant a build is from. They share the `llama-bench` /
+/// `llama-server` CLI, so the runner drives them identically — but results are
+/// recorded under the variant's name so they stay comparable yet distinct.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// Upstream ggml-org/llama.cpp (the default; the only one with prebuilt downloads).
+    #[value(name = "llama.cpp")]
+    LlamaCpp,
+    /// ikawrakow/ik_llama.cpp — CPU/quant-focused fork.
+    #[value(name = "ik_llama.cpp")]
+    IkLlamaCpp,
+    /// beellama.cpp.
+    #[value(name = "beellama.cpp")]
+    BeeLlamaCpp,
+    /// Xpress AI's ve_llama.cpp — adds NEC SX-Aurora Vector Engine support.
+    #[value(name = "ve_llama.cpp")]
+    VeLlamaCpp,
+}
+
+impl Family {
+    /// The string recorded as `backend.name` (matches the --family value).
+    fn backend_name(self) -> &'static str {
+        match self {
+            Family::LlamaCpp => "llama.cpp",
+            Family::IkLlamaCpp => "ik_llama.cpp",
+            Family::BeeLlamaCpp => "beellama.cpp",
+            Family::VeLlamaCpp => "ve_llama.cpp",
+        }
+    }
+}
+
 #[derive(Args, Clone)]
 struct RunArgs {
     /// Directory containing llama-bench / llama-server. Default: search PATH, else
@@ -67,6 +98,12 @@ struct RunArgs {
     /// at your own GPU build for full speed.
     #[arg(long)]
     download_llama: bool,
+    /// Which llama.cpp variant the build is. Recorded as the backend so results
+    /// stay comparable but distinct. The forks (ik_llama.cpp, beellama.cpp,
+    /// ve_llama.cpp) share the same CLI — build one and point --llama-dir at it
+    /// (only upstream llama.cpp can be auto-downloaded).
+    #[arg(long, value_enum, default_value = "llama.cpp")]
+    family: Family,
     /// Path to a local GGUF model. Combine with --hf-model --quant to record and
     /// hash-verify the file's Hugging Face provenance (the local bytes are still used).
     #[arg(long)]
@@ -328,6 +365,19 @@ fn resolve_llama_dir(a: &RunArgs, required: &[&str]) -> Result<String> {
         return Ok(a.llama_dir.clone());
     }
     let on_path = required.iter().all(|b| find_on_path(b));
+    // Only upstream llama.cpp has prebuilt downloads. For a fork, use its build:
+    // an explicit --llama-dir (above) or its binaries on PATH — never auto-download.
+    if a.family != Family::LlamaCpp {
+        if on_path {
+            return Ok(String::new());
+        }
+        bail!(
+            "{} has no prebuilt download — build it and pass \
+             --llama-dir <path-to/build/bin> (or put its {} on PATH).",
+            a.family.backend_name(),
+            required.join("/")
+        );
+    }
     if !a.download_llama {
         if on_path {
             return Ok(String::new());
@@ -493,7 +543,7 @@ fn build_submission(
             command: Some(command),
         },
         backend: Backend {
-            name: "llama.cpp".to_string(),
+            name: a.family.backend_name().to_string(),
             version: b.build_number.clone(),
             git_hash: b.git_hash.clone(),
         },
@@ -644,6 +694,16 @@ mod tests {
         );
         assert_eq!(quant_from_path("/x/model-IQ4_XS.gguf"), "IQ4_XS");
         assert_eq!(quant_from_path("/x/plain.gguf"), "unknown");
+    }
+
+    #[test]
+    fn family_backend_names() {
+        // These strings are the recorded backend.name and the --family values; the
+        // leaderboard groups on them, so pin them.
+        assert_eq!(Family::LlamaCpp.backend_name(), "llama.cpp");
+        assert_eq!(Family::IkLlamaCpp.backend_name(), "ik_llama.cpp");
+        assert_eq!(Family::BeeLlamaCpp.backend_name(), "beellama.cpp");
+        assert_eq!(Family::VeLlamaCpp.backend_name(), "ve_llama.cpp");
     }
 
     #[test]
