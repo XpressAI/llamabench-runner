@@ -52,7 +52,7 @@ pub struct VerifyOpts<'a> {
     pub n_gen: u32,
     pub max_turns: u32,
     pub reps: u32,
-    pub extra_server_args: &'a [String],
+    pub extra_server_args: Vec<String>,
 }
 
 /// Kills the spawned server on drop so we never leak a process.
@@ -77,7 +77,7 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
         opts.api_key,
         "--jinja",
     ])
-    .args(opts.extra_server_args)
+    .args(&opts.extra_server_args)
     .stdout(Stdio::null())
     .stderr(Stdio::null());
     let child = cmd

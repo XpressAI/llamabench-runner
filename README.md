@@ -101,8 +101,17 @@ llamabench run --model /path/to/model.gguf --dry-run
 (and you're not using `--dry-run`), it errors and points you at `llamabench auth`.
 
 Common flags (see `--help` for the full list): `--ngl`, `--fa`, `--ctk`/`--ctv` (KV cache type),
-`--n-prompt`/`--n-gen`, `--spec-decode`, `--seed`, `--turns`, `--reps`, and `--server-arg` to pass
-extra flags straight through to `llama-server`.
+`--n-prompt`/`--n-gen`, `--spec-decode`, `--seed`, `--turns`, `--reps`.
+
+Pass extra flags straight through to `llama-server` (handy for the many speculative-decoding
+options) with either:
+
+- **`--server-args "<flags>"`** — one whitespace-delimited string, e.g.
+  `--server-args "--spec-type draft-mtp --spec-draft-n-max 2"`. Easiest for a bunch at once.
+- **`--server-arg <value>`** — repeatable, one value each
+  (`--server-arg --foo --server-arg "two words"`). Use it when a value contains spaces.
+
+Both are appended (repeatable `--server-arg` first, then the split `--server-args`).
 
 ## Build from source
 

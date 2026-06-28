@@ -153,9 +153,16 @@ struct RunArgs {
     turns: u32,
     #[arg(long, default_value_t = 3)]
     reps: u32,
-    /// Extra args passed verbatim to llama-server (e.g. spec-decode flags).
-    #[arg(long = "server-arg")]
-    server_args: Vec<String>,
+    /// Extra arg passed verbatim to llama-server, repeatable:
+    /// `--server-arg --foo --server-arg bar`. Use this when a value contains spaces.
+    #[arg(long = "server-arg", allow_hyphen_values = true)]
+    server_arg: Vec<String>,
+    /// Extra llama-server args as ONE whitespace-delimited string — convenient for the
+    /// many speculative-decoding flags, e.g.
+    /// `--server-args "--spec-type draft-mtp --spec-draft-n-max 2"`. Split on whitespace
+    /// and appended after any --server-arg values.
+    #[arg(long = "server-args", default_value = "", allow_hyphen_values = true)]
+    server_args: String,
 
     /// Detect & build the result without submitting.
     #[arg(long)]
@@ -182,6 +189,13 @@ fn bench_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> BenchOp
 }
 
 fn verify_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> VerifyOpts<'a> {
+    // Repeatable --server-arg values first, then the whitespace-split --server-args string.
+    let extra_server_args = a
+        .server_arg
+        .iter()
+        .cloned()
+        .chain(a.server_args.split_whitespace().map(String::from))
+        .collect();
     VerifyOpts {
         server_bin_dir: llama_dir,
         model,
@@ -191,7 +205,7 @@ fn verify_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> Verify
         n_gen: a.n_gen,
         max_turns: a.turns,
         reps: a.reps,
-        extra_server_args: &a.server_args,
+        extra_server_args,
     }
 }
 
@@ -677,6 +691,39 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_args_combine() {
+        // Repeatable --server-arg values, then the whitespace-split --server-args string.
+        let cli = Cli::parse_from([
+            "llamabench",
+            "run",
+            "--server-arg",
+            "--foo",
+            "--server-arg",
+            "bar",
+            "--server-args",
+            "--spec-type draft-mtp --spec-draft-n-max 2",
+            "--hf-model",
+            "x/y",
+            "--quant",
+            "Q4_K_M",
+        ]);
+        let Command::Run(a) = cli.command else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            verify_opts(&a, "/d", "/m.gguf").extra_server_args,
+            vec![
+                "--foo",
+                "bar",
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "2"
+            ]
+        );
+    }
 
     #[test]
     fn canonical_identity_from_base_model() {
