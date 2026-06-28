@@ -375,14 +375,21 @@ fn quant_from_path(model: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    stem.split('-')
-        .find(|tok| {
-            (tok.starts_with('Q') || tok.starts_with("IQ"))
-                && *tok == tok.to_uppercase()
-                && tok.chars().any(|c| c.is_ascii_digit())
-        })
-        .unwrap_or("unknown")
-        .to_string()
+    let toks: Vec<&str> = stem.split('-').collect();
+    let is_quant = |tok: &str| {
+        (tok.starts_with('Q') || tok.starts_with("IQ"))
+            && tok == tok.to_uppercase()
+            && tok.chars().any(|c| c.is_ascii_digit())
+    };
+    match toks.iter().position(|t| is_quant(t)) {
+        // Keep an Unsloth "UD" (Unsloth Dynamic) prefix — it's part of the quant identity,
+        // so `…-UD-Q4_K_XL.gguf` records as `UD-Q4_K_XL`, not `Q4_K_XL`.
+        Some(i) if i > 0 && toks[i - 1].eq_ignore_ascii_case("UD") => {
+            format!("UD-{}", toks[i])
+        }
+        Some(i) => toks[i].to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 fn model_name(model: &str) -> String {
@@ -436,9 +443,15 @@ fn build_submission(
             (detect::slugify(&label), label)
         }
     };
+    // Record the model by file name only (./<file>.gguf) — never the submitter's local
+    // absolute path, which would leak their home directory.
+    let model_file = Path::new(model)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model);
     let command = format!(
-        "llama-bench -m {} -ngl {} -fa {} -ctk {} -ctv {} -p {} -n {}",
-        model, a.ngl, a.fa, a.ctk, a.ctv, a.n_prompt, a.n_gen
+        "llama-bench -m ./{} -ngl {} -fa {} -ctk {} -ctv {} -p {} -n {}",
+        model_file, a.ngl, a.fa, a.ctk, a.ctv, a.n_prompt, a.n_gen
     );
     ResultSubmission {
         schema_version: SCHEMA_VERSION,
@@ -607,10 +620,18 @@ mod tests {
 
     #[test]
     fn quant_parsing() {
-        assert_eq!(quant_from_path("/x/Qwen3.5-4B-UD-Q4_K_XL.gguf"), "Q4_K_XL");
+        // Unsloth Dynamic "UD" prefix is preserved (it's a distinct quant recipe).
+        assert_eq!(
+            quant_from_path("/x/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+            "UD-Q4_K_XL"
+        );
         assert_eq!(
             quant_from_path("/x/gemma-4-12b-it-UD-Q4_K_XL.gguf"),
-            "Q4_K_XL"
+            "UD-Q4_K_XL"
+        );
+        assert_eq!(
+            quant_from_path("/x/Meta-Llama-3.1-8B-Q4_K_M.gguf"),
+            "Q4_K_M"
         );
         assert_eq!(quant_from_path("/x/model-IQ4_XS.gguf"), "IQ4_XS");
         assert_eq!(quant_from_path("/x/plain.gguf"), "unknown");
