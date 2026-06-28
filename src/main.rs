@@ -78,8 +78,9 @@ struct RunArgs {
     /// base_model) so every GGUF repack of the same model groups together.
     #[arg(long)]
     hf_model: Option<String>,
-    /// Quantization to select/report, e.g. Q4_K_M. Required with --hf-model; with
-    /// --model it overrides the quant parsed from the filename.
+    /// Quantization, e.g. Q4_K_M. Required with --hf-model (selects the .gguf to fetch).
+    /// The recorded quant is read from the actual file name (so variants like
+    /// UD-Q4_K_XL are preserved); --quant is only a fallback if the name has none.
     #[arg(long)]
     quant: Option<String>,
     /// Submitter handle.
@@ -400,14 +401,22 @@ fn model_name(model: &str) -> String {
         .to_string()
 }
 
-/// The quant to record: explicit `--quant` wins, else parse it from the filename.
+/// The quant to record. The actual file's name is authoritative (it preserves variants
+/// like Unsloth Dynamic `UD-Q4_K_XL`), so we parse it from the file first; `--quant`
+/// (which is mainly the HF selector) is only the fallback when the name has no parseable
+/// quant. For an `--hf-model` download, `model` is the downloaded file, so this still
+/// reflects exactly what ran.
 fn resolved_quant(a: &RunArgs, model: &str) -> String {
+    let from_file = quant_from_path(model);
+    if from_file != "unknown" {
+        return from_file;
+    }
     a.quant
         .as_deref()
         .map(str::trim)
         .filter(|q| !q.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| quant_from_path(model))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn build_submission(
