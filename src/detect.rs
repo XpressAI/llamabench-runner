@@ -43,6 +43,44 @@ pub fn nvidia_gpu_name() -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(target_os = "macos")]
+fn sysctl(key: &str) -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Best-effort accelerator name when the backend banner didn't yield one: nvidia-smi for
+/// NVIDIA, then the Apple-silicon chip via sysctl on macOS (Metal banners vary and are easy
+/// to misparse). None on a plain CPU box.
+pub fn gpu_name() -> Option<String> {
+    if let Some(n) = nvidia_gpu_name() {
+        return Some(n);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(n) = sysctl("machdep.cpu.brand_string").filter(|n| n.starts_with("Apple")) {
+        return Some(n); // e.g. "Apple M4"
+    }
+    None
+}
+
+/// Apple unified memory (≈ usable GPU memory) in GB, via sysctl. 0 off macOS / on failure.
+pub fn apple_unified_mem_gb() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bytes) = sysctl("hw.memsize").and_then(|s| s.parse::<f64>().ok()) {
+            return (bytes / 1e9).round();
+        }
+    }
+    0.0
+}
+
 /// A stable, lowercase, dash-separated slug for an id.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

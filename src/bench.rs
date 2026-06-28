@@ -204,26 +204,43 @@ fn parse_build(line: &str) -> Option<(String, String)> {
     Some((format!("b{num}"), hash))
 }
 
-/// Extract a device name from a backend init banner (printed to stderr). Handles the two
-/// shapes llama.cpp uses:
-///   Vulkan/Metal/SYCL: "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..."
-///   CUDA/HIP(ROCm):    "  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes"
+/// Extract a device name from a backend init banner (printed to stderr). Handles the
+/// shapes llama.cpp uses across backends:
+///   Vulkan/SYCL: "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..."
+///   Metal:       "ggml_metal_init: picking default device: Apple M4" / "GPU name: Apple M4"
+///   CUDA/HIP:    "  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes"
 fn parse_device(line: &str) -> Option<String> {
     let l = line.trim();
 
-    // "ggml_xxx: N = <name> | ..."
-    if l.starts_with("ggml_") && l.contains(" = ") {
-        if let Some(after) = l.split(" = ").nth(1) {
-            let name = after.split(" | ").next().unwrap_or("").trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
+    if l.starts_with("ggml_") {
+        // Vulkan/SYCL: "ggml_vulkan: 0 = <name> | ...". REQUIRE a numeric device index right
+        // before " = ", or we'd grab config lines like "...: hasUnifiedMemory = true" (this is
+        // the bug that recorded an M4 Mac as a stray "180 s)" timing value).
+        if let Some(eq) = l.find(" = ") {
+            let idx_ok = l[..eq]
+                .rsplit([' ', ':'])
+                .next()
+                .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()));
+            if idx_ok {
+                let name = l[eq + 3..].split(" | ").next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        // Metal: the device name is after "device: " (found/picking default) or "GPU name:".
+        for key in [" device: ", "GPU name:"] {
+            if let Some(p) = l.find(key) {
+                let name = l[p + key.len()..].trim();
+                if !name.is_empty() && !name.contains('=') {
+                    return Some(name.to_string());
+                }
             }
         }
     }
 
     // "Device <n>: <name>, compute capability ..." — the CUDA/HIP banner. The name runs
-    // from after "Device N: " up to the first comma. (This is what the old parser missed,
-    // so CUDA runs were recorded as "CPU".)
+    // from after "Device N: " up to the first comma.
     if let Some(pos) = l.find("Device ") {
         let tail = &l[pos + "Device ".len()..];
         if let Some(colon) = tail.find(": ") {
@@ -333,5 +350,28 @@ ggml_cuda_init: found 1 CUDA devices:
             Some("AMD Radeon Pro 5500M (MoltenVK)".to_string())
         );
         assert_eq!(parse_device("llama_model_loader: loaded meta data"), None);
+    }
+
+    #[test]
+    fn metal_device_and_no_false_positives() {
+        // Apple Metal device name (the M4 Mac case).
+        assert_eq!(
+            parse_device("ggml_metal_init: picking default device: Apple M4"),
+            Some("Apple M4".to_string())
+        );
+        assert_eq!(
+            parse_device("ggml_metal_init: GPU name:   Apple M4 Max"),
+            Some("Apple M4 Max".to_string())
+        );
+        // Metal config lines have "=" but no numeric device index — must NOT be read as a
+        // device (this is what produced the bogus "180 s)" hardware).
+        assert_eq!(
+            parse_device("ggml_metal_init: hasUnifiedMemory              = true"),
+            None
+        );
+        assert_eq!(
+            parse_device("ggml_metal_init: recommendedMaxWorkingSetSize  = 180.00 MB (in 180 s)"),
+            None
+        );
     }
 }

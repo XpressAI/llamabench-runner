@@ -484,14 +484,9 @@ fn build_submission(
         .first()
         .cloned()
         // The backend banner didn't name a device. If the run actually used the GPU
-        // (ngl != 0), ask nvidia-smi rather than mislabeling a GPU run as "CPU".
-        .or_else(|| {
-            if a.ngl != 0 {
-                detect::nvidia_gpu_name()
-            } else {
-                None
-            }
-        })
+        // (ngl != 0), ask the system (nvidia-smi / macOS sysctl) rather than mislabeling
+        // a GPU run as "CPU".
+        .or_else(|| if a.ngl != 0 { detect::gpu_name() } else { None })
         .unwrap_or_else(|| "CPU".to_string());
     // Canonical model identity (from the GGUF's HF base_model) when we resolved one, so
     // every GGUF repack of the same model groups together; otherwise fall back to the
@@ -523,13 +518,21 @@ fn build_submission(
         "llama-bench -m ./{} -ngl {} -fa {} -ctk {} -ctv {} -p {} -n {}",
         model_file, a.ngl, a.fa, a.ctk, a.ctv, a.n_prompt, a.n_gen
     );
+    let vendor = detect::vendor_of(&device);
+    // Apple is unified memory (≈ usable GPU memory); report it so the site shows real VRAM.
+    // For discrete GPUs the server fills VRAM/bandwidth from its catalog.
+    let vram_gb = if vendor == "Apple" {
+        detect::apple_unified_mem_gb()
+    } else {
+        0.0
+    };
     ResultSubmission {
         schema_version: SCHEMA_VERSION,
         hardware: Hardware {
             id: detect::slugify(&device),
             name: device.clone(),
-            vendor: detect::vendor_of(&device).to_string(),
-            vram_gb: 0.0,
+            vendor: vendor.to_string(),
+            vram_gb,
             bandwidth_gbs: 0.0,
         },
         model: ModelInfo {
