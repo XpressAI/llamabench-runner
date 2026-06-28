@@ -204,19 +204,39 @@ fn parse_build(line: &str) -> Option<(String, String)> {
     Some((format!("b{num}"), hash))
 }
 
-/// "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..." -> the device name.
+/// Extract a device name from a backend init banner (printed to stderr). Handles the two
+/// shapes llama.cpp uses:
+///   Vulkan/Metal/SYCL: "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..."
+///   CUDA/HIP(ROCm):    "  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes"
 fn parse_device(line: &str) -> Option<String> {
     let l = line.trim();
-    if !(l.starts_with("ggml_") && l.contains(" = ")) {
-        return None;
+
+    // "ggml_xxx: N = <name> | ..."
+    if l.starts_with("ggml_") && l.contains(" = ") {
+        if let Some(after) = l.split(" = ").nth(1) {
+            let name = after.split(" | ").next().unwrap_or("").trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
     }
-    let after = l.split(" = ").nth(1)?;
-    let name = after.split(" | ").next()?.trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+
+    // "Device <n>: <name>, compute capability ..." — the CUDA/HIP banner. The name runs
+    // from after "Device N: " up to the first comma. (This is what the old parser missed,
+    // so CUDA runs were recorded as "CPU".)
+    if let Some(pos) = l.find("Device ") {
+        let tail = &l[pos + "Device ".len()..];
+        if let Some(colon) = tail.find(": ") {
+            let (idx, rest) = tail.split_at(colon);
+            if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
+                let name = rest[2..].split(',').next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
     }
+    None
 }
 
 #[cfg(test)]
@@ -272,5 +292,46 @@ build: 7dad2f1a1 (9660)";
         assert_eq!(r.backend_label, "Vulkan,BLAS");
         // type_k/type_v are absent from the table here; run_llama_bench fills them from opts.
         assert_eq!(r.type_k, "");
+    }
+
+    // CUDA layout: the device name comes from a stderr "Device N: <name>, ..." banner, not
+    // the "ggml_xxx: N = <name>" form. The old parser missed it, so CUDA runs (like the
+    // user's RTX 3090 gemma run) were recorded as "CPU".
+    const STDOUT_CUDA: &str = "\
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| gemma4 12B Q4_K - Medium       |   6.85 GiB |    11.91 B | CUDA       |  -1 |   1 |           pp512 |       3200.00 ± 9.00 |
+| gemma4 12B Q4_K - Medium       |   6.85 GiB |    11.91 B | CUDA       |  -1 |   1 |           tg128 |         85.20 ± 0.30 |
+
+build: a1b2c3d4 (9829)";
+    const STDERR_CUDA: &str = "\
+ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
+ggml_cuda_init: found 1 CUDA devices:
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes";
+
+    #[test]
+    fn parses_cuda_device_banner() {
+        let r = parse(STDOUT_CUDA, STDERR_CUDA);
+        assert!((r.decode_tps - 85.20).abs() < 0.01);
+        assert_eq!(r.backend_label, "CUDA");
+        assert!(r.flash_attn);
+        assert_eq!(r.devices, vec!["NVIDIA GeForce RTX 3090".to_string()]);
+        // vendor inference downstream should now read NVIDIA, not CPU.
+        assert_eq!(crate::detect::vendor_of(&r.devices[0]), "NVIDIA");
+    }
+
+    #[test]
+    fn device_banner_shapes() {
+        assert_eq!(
+            parse_device(
+                "  Device 0: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, VMM: yes"
+            ),
+            Some("NVIDIA GeForce RTX 5070 Ti".to_string())
+        );
+        assert_eq!(
+            parse_device("ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0"),
+            Some("AMD Radeon Pro 5500M (MoltenVK)".to_string())
+        );
+        assert_eq!(parse_device("llama_model_loader: loaded meta data"), None);
     }
 }

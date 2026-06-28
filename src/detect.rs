@@ -24,6 +24,25 @@ pub fn vendor_of(name: &str) -> &'static str {
     }
 }
 
+/// Best-effort GPU name from `nvidia-smi`, used as a fallback when the backend init banner
+/// didn't yield a device name (e.g. a build whose device line we don't recognize). Returns
+/// the first GPU's name, or None if nvidia-smi is absent/fails. Only call this when the run
+/// actually used the GPU, so a CPU-only run isn't mislabeled as the installed card.
+pub fn nvidia_gpu_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// A stable, lowercase, dash-separated slug for an id.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

@@ -483,6 +483,15 @@ fn build_submission(
         .devices
         .first()
         .cloned()
+        // The backend banner didn't name a device. If the run actually used the GPU
+        // (ngl != 0), ask nvidia-smi rather than mislabeling a GPU run as "CPU".
+        .or_else(|| {
+            if a.ngl != 0 {
+                detect::nvidia_gpu_name()
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| "CPU".to_string());
     // Canonical model identity (from the GGUF's HF base_model) when we resolved one, so
     // every GGUF repack of the same model groups together; otherwise fall back to the
