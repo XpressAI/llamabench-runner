@@ -479,13 +479,14 @@ fn build_submission(
     v: Option<Verification>,
     hf: HfProvenance,
 ) -> ResultSubmission {
-    let device = b
-        .devices
-        .first()
-        .cloned()
-        // The backend banner didn't name a device. If the run actually used the GPU
-        // (ngl != 0), ask the system (nvidia-smi / macOS sysctl) rather than mislabeling
-        // a GPU run as "CPU".
+    // On Apple Silicon the GPU is the chip, and the Metal banner reads noisily as
+    // "MTL0 (Apple M4)"; sysctl gives the clean canonical name, so prefer it for GPU runs.
+    let device = (a.ngl != 0)
+        .then(detect::apple_chip)
+        .flatten()
+        .or_else(|| b.devices.first().cloned())
+        // Banner gave nothing and it's a GPU run — ask the system (nvidia-smi) rather than
+        // mislabeling a GPU run as "CPU".
         .or_else(|| if a.ngl != 0 { detect::gpu_name() } else { None })
         .unwrap_or_else(|| "CPU".to_string());
     // Canonical model identity (from the GGUF's HF base_model) when we resolved one, so

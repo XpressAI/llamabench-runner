@@ -56,18 +56,23 @@ fn sysctl(key: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Best-effort accelerator name when the backend banner didn't yield one: nvidia-smi for
-/// NVIDIA, then the Apple-silicon chip via sysctl on macOS (Metal banners vary and are easy
-/// to misparse). None on a plain CPU box.
-pub fn gpu_name() -> Option<String> {
-    if let Some(n) = nvidia_gpu_name() {
-        return Some(n);
-    }
+/// The Apple-silicon chip name via sysctl (e.g. "Apple M4"), or None off macOS / non-Apple.
+/// This is authoritative for Apple GPUs and clean, unlike the Metal banner which can read
+/// as "MTL0 (Apple M4)".
+pub fn apple_chip() -> Option<String> {
     #[cfg(target_os = "macos")]
-    if let Some(n) = sysctl("machdep.cpu.brand_string").filter(|n| n.starts_with("Apple")) {
-        return Some(n); // e.g. "Apple M4"
+    {
+        if let Some(n) = sysctl("machdep.cpu.brand_string").filter(|n| n.starts_with("Apple")) {
+            return Some(n);
+        }
     }
     None
+}
+
+/// Best-effort accelerator name when the backend banner didn't yield one: nvidia-smi for
+/// NVIDIA, then the Apple-silicon chip via sysctl. None on a plain CPU box.
+pub fn gpu_name() -> Option<String> {
+    nvidia_gpu_name().or_else(apple_chip)
 }
 
 /// Apple unified memory (≈ usable GPU memory) in GB, via sysctl. 0 off macOS / on failure.
