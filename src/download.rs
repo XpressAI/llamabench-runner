@@ -70,6 +70,39 @@ pub fn hf_resolve(repo: &str, quant: &str) -> Result<HfFile> {
     })
 }
 
+/// Resolve a repo's expected SHA-256 for the `.gguf` matching `quant`, via the HF
+/// **tree API** (`/api/models/<repo>/tree/main`). Each entry is `{path, size,
+/// lfs:{oid, size}}`; for an LFS-tracked GGUF the `lfs.oid` IS the file's sha256, so
+/// it lets us verify a local file's provenance without downloading the blob. Returns
+/// `Ok(None)` when no `.gguf` matches the quant (or the match isn't LFS-tracked, so
+/// no oid is published).
+pub fn hf_expected_sha256(repo: &str, quant: &str) -> Result<Option<String>> {
+    let api = format!("https://huggingface.co/api/models/{repo}/tree/main");
+    let resp = ureq::get(&api)
+        .set("User-Agent", UA)
+        .call()
+        .map_err(|e| anyhow!("Hugging Face tree API request failed for '{repo}': {e}"))?;
+    let v: Value = resp.into_json().context("decoding HF tree metadata")?;
+    let entries = v
+        .as_array()
+        .ok_or_else(|| anyhow!("unexpected HF tree API response for '{repo}' (not a list)"))?;
+    let ggufs: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e["path"].as_str())
+        .filter(|p| p.to_lowercase().ends_with(".gguf"))
+        .map(|p| p.to_string())
+        .collect();
+    let Some(file) = pick_gguf(&ggufs, quant) else {
+        return Ok(None);
+    };
+    let oid = entries
+        .iter()
+        .find(|e| e["path"].as_str() == Some(file.as_str()))
+        .and_then(|e| e["lfs"]["oid"].as_str())
+        .map(str::to_string);
+    Ok(oid)
+}
+
 /// Resolve, then stream the model to the cache (skipping if already present at the
 /// expected size). Returns the local path to use as `--model`.
 pub fn hf_download(repo: &str, quant: &str) -> Result<PathBuf> {
@@ -478,5 +511,18 @@ mod tests {
         assert!(f.filename.to_lowercase().ends_with(".gguf"));
         assert!(f.url.contains("/resolve/main/"));
         eprintln!("resolved: {} -> {}", f.filename, f.url);
+    }
+
+    // Live smoke against the HF tree API: resolve the published sha256 (lfs.oid) for a
+    // tiny GGUF *without downloading the blob*. Ignored by default (network).
+    #[test]
+    #[ignore = "network: hits the live Hugging Face tree API"]
+    fn hf_expected_sha256_live_1b() {
+        let oid = hf_expected_sha256("bartowski/Llama-3.2-1B-Instruct-GGUF", "Q4_K_M")
+            .unwrap()
+            .expect("Q4_K_M gguf should publish an lfs oid");
+        assert_eq!(oid.len(), 64, "sha256 is 64 hex chars");
+        assert!(oid.chars().all(|c| c.is_ascii_hexdigit()));
+        eprintln!("expected sha256: {oid}");
     }
 }

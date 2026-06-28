@@ -16,7 +16,7 @@ mod detect;
 mod download;
 mod verify;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -67,12 +67,13 @@ struct RunArgs {
     /// at your own GPU build for full speed.
     #[arg(long)]
     download_llama: bool,
-    /// Path to a local GGUF model. Mutually exclusive with --hf-model.
+    /// Path to a local GGUF model. Combine with --hf-model --quant to record and
+    /// hash-verify the file's Hugging Face provenance (the local bytes are still used).
     #[arg(long)]
     model: Option<String>,
-    /// Hugging Face repo to fetch the GGUF from, e.g.
-    /// bartowski/Llama-3.1-8B-Instruct-GGUF. Requires --quant. Mutually exclusive
-    /// with --model.
+    /// Hugging Face repo for the GGUF, e.g. bartowski/Llama-3.1-8B-Instruct-GGUF
+    /// (requires --quant). WITHOUT --model the file is downloaded from here; WITH
+    /// --model the local file is used but its SHA-256 is verified against this repo.
     #[arg(long)]
     hf_model: Option<String>,
     /// Quantization to select/report, e.g. Q4_K_M. Required with --hf-model; with
@@ -152,18 +153,19 @@ fn verify_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> Verify
     }
 }
 
-/// Resolve the model path: a local `--model`, or download the `--hf-model` +
-/// `--quant` GGUF. Exactly one of the two must be given.
+/// Resolve the model path. A local `--model` is always the file we benchmark; if
+/// `--hf-model` is also given it only attributes provenance (see `hf_provenance`).
+/// With `--hf-model` alone, download the `--quant` GGUF from the repo. At least one
+/// of the two must be given.
 fn resolve_model(a: &RunArgs) -> Result<String> {
     match (&a.model, &a.hf_model) {
-        (Some(_), Some(_)) => {
-            bail!("specify either --model <path> or --hf-model <repo>, not both")
-        }
         (None, None) => bail!(
             "no model: pass --model <path.gguf>, or --hf-model <repo> --quant <Q> \
              (e.g. --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M)"
         ),
-        (Some(m), None) => Ok(m.clone()),
+        // A local file always wins for the bytes we run; --hf-model alongside it is
+        // recorded/verified as provenance, not downloaded.
+        (Some(m), _) => Ok(m.clone()),
         (None, Some(repo)) => {
             let quant = a
                 .quant
@@ -179,6 +181,88 @@ fn resolve_model(a: &RunArgs) -> Result<String> {
                 .into_owned())
         }
     }
+}
+
+/// Hugging Face provenance recorded on the model: the source repo and whether the
+/// bytes are confirmed to come from it. Maps to `ModelInfo.hf_model` / `hf_verified`.
+struct HfProvenance {
+    model: Option<String>,
+    verified: Option<bool>,
+}
+
+/// Decide the HF provenance for this run:
+/// * `--hf-model` alone (download path): the bytes came straight from the repo ⇒ verified.
+/// * `--model` + `--hf-model`: hash-verify the local file against the repo (`verify_hf_hash`).
+/// * `--model` alone: no provenance.
+fn hf_provenance(a: &RunArgs, model: &str, quant: &str) -> HfProvenance {
+    match (&a.model, &a.hf_model) {
+        (None, Some(repo)) => HfProvenance {
+            model: Some(repo.clone()),
+            verified: Some(true),
+        },
+        (Some(_), Some(repo)) => HfProvenance {
+            model: Some(repo.clone()),
+            verified: Some(verify_hf_hash(model, repo, quant)),
+        },
+        _ => HfProvenance {
+            model: None,
+            verified: None,
+        },
+    }
+}
+
+/// Verify a local GGUF against the HF repo it claims to be, by SHA-256. HF publishes
+/// each LFS file's sha256 as its `lfs.oid` (tree API), so we stream-hash the local
+/// file and compare — no re-download. Network/resolution failures are non-fatal: they
+/// just mean "unverified" (`false`), so a run never fails over provenance.
+fn verify_hf_hash(model: &str, repo: &str, quant: &str) -> bool {
+    let local = match file_sha256(Path::new(model)) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!(
+                "⚠ HF verify: could not hash local file {model} ({e}) — recording as unverified"
+            );
+            return false;
+        }
+    };
+    match download::hf_expected_sha256(repo, quant) {
+        Ok(Some(expected)) if local.eq_ignore_ascii_case(&expected) => {
+            eprintln!("✓ HF hash verified: matches {repo}");
+            true
+        }
+        Ok(Some(_)) => {
+            eprintln!("⚠ HF hash MISMATCH: local file differs from {repo} ({model})");
+            false
+        }
+        Ok(None) => {
+            eprintln!(
+                "⚠ HF verify: no .gguf in {repo} matches quant '{quant}' — recording as unverified"
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠ HF verify: could not fetch {repo} file hash ({e}) — recording as unverified"
+            );
+            false
+        }
+    }
+}
+
+/// Stream a file through SHA-256, returning lowercase hex. Uses `io::copy` into the
+/// hasher so a multi-GB model is never read into memory at once.
+fn file_sha256(path: &Path) -> Result<String> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("opening {} to hash", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher)
+        .with_context(|| format!("hashing {}", path.display()))?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Resolve the directory holding the required llama.cpp binaries: an explicit
@@ -271,6 +355,7 @@ fn build_submission(
     quant: &str,
     b: &BenchResult,
     v: Option<Verification>,
+    hf: HfProvenance,
 ) -> ResultSubmission {
     let device = b
         .devices
@@ -295,6 +380,8 @@ fn build_submission(
             id: detect::slugify(&name),
             name,
             params: b.params_b,
+            hf_model: hf.model,
+            hf_verified: hf.verified,
         },
         metrics: Metrics {
             decode_tps: b.decode_tps,
@@ -344,7 +431,12 @@ fn submit(api: &str, token: &str, s: &ResultSubmission) -> Result<()> {
         .send_json(s)
         .map_err(|e| anyhow::anyhow!("submit failed: {e}"))?;
     let body: serde_json::Value = resp.into_json()?;
-    eprintln!("✓ submitted: {body}");
+    // The API returns { ok, id, url } with `url` an absolute result link. Print it as
+    // a clean, clickable line; fall back to the raw body if it's missing.
+    match body.get("url").and_then(serde_json::Value::as_str) {
+        Some(url) => eprintln!("✓ Submitted: {url}"),
+        None => eprintln!("✓ submitted: {body}"),
+    }
     Ok(())
 }
 
@@ -372,7 +464,8 @@ fn main() -> Result<()> {
             let dir = resolve_llama_dir(&a, &["llama-bench"])?;
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             let quant = resolved_quant(&a, &model);
-            emit(&build_submission(&a, &model, &quant, &b, None))?;
+            let hf = hf_provenance(&a, &model, &quant);
+            emit(&build_submission(&a, &model, &quant, &b, None, hf))?;
         }
         Command::Verify(a) => {
             let model = resolve_model(&a)?;
@@ -402,7 +495,8 @@ fn main() -> Result<()> {
             );
             let v = run_verification(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
-            let mut submission = build_submission(&a, &model, &quant, &b, Some(v));
+            let hf = hf_provenance(&a, &model, &quant);
+            let mut submission = build_submission(&a, &model, &quant, &b, Some(v), hf);
             sign(&mut submission)?;
             emit(&submission)?;
             if !valid {
@@ -430,5 +524,19 @@ mod tests {
         );
         assert_eq!(quant_from_path("/x/model-IQ4_XS.gguf"), "IQ4_XS");
         assert_eq!(quant_from_path("/x/plain.gguf"), "unknown");
+    }
+
+    #[test]
+    fn file_sha256_streaming_matches_known() {
+        // SHA-256("abc") — the canonical NIST test vector.
+        let mut path = std::env::temp_dir();
+        path.push(format!("llamabench_sha256_{}.bin", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let got = file_sha256(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            got.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

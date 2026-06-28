@@ -41,6 +41,11 @@ llamabench run --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M \
 # Or use a local model file:
 llamabench run --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/bin
 
+# Use a LOCAL file but attribute + hash-verify its Hugging Face provenance
+# (records the repo and a ✓/⚠ verified flag; the local bytes are what's benchmarked):
+llamabench run --model /path/to/Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+  --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M
+
 # Speed only — run llama-bench and print the numbers:
 llamabench bench --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/bin
 
@@ -57,6 +62,12 @@ llamabench run --model /path/to/model.gguf --dry-run
   (streamed to a per-user cache, skipped if already present), picking the `.gguf`
   whose name matches the quant. `--quant` also sets the quant recorded in the result.
   Use `--model <path>` instead to point at a local file.
+- **`--model <path> --hf-model <repo> --quant <Q>`** (given *together*) benchmarks the
+  **local** file but records its Hugging Face provenance and verifies it: the runner
+  streams the local file through SHA-256 and compares it against the repo's published
+  hash (the `lfs.oid` from HF's tree API) for the matching quant. The result carries
+  `hfModel` and `hfVerified` (`✓` match / `⚠` mismatch). A provenance check that can't
+  be resolved records `hfVerified: false` and never fails the run.
 - **`--download-llama`** grabs the latest prebuilt llama.cpp release for your OS/arch.
   **This is the standard CPU/Metal build only — GPU builds (CUDA / HIP / Vulkan) are
   NOT auto-selected.** If you have a GPU, build llama.cpp yourself and point

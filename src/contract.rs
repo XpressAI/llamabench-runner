@@ -23,6 +23,14 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub params: f64,
+    /// Source Hugging Face repo this model is attributed to (download path, or a
+    /// local `--model` paired with `--hf-model`). Omitted for an unattributed local file.
+    #[serde(rename = "hfModel", skip_serializing_if = "Option::is_none")]
+    pub hf_model: Option<String>,
+    /// Whether the model's bytes were confirmed to come from `hf_model`: trivially
+    /// true on the download path, or the result of a SHA-256 match for a local file.
+    #[serde(rename = "hfVerified", skip_serializing_if = "Option::is_none")]
+    pub hf_verified: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,4 +119,38 @@ pub struct ResultSubmission {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Submitter {
     pub handle: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_info_serializes_hf_fields() {
+        let m = ModelInfo {
+            id: "x".to_string(),
+            name: "X".to_string(),
+            params: 1.0,
+            hf_model: Some("bartowski/Foo-GGUF".to_string()),
+            hf_verified: Some(true),
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["hfModel"], "bartowski/Foo-GGUF");
+        assert_eq!(j["hfVerified"], true);
+    }
+
+    #[test]
+    fn model_info_omits_hf_fields_when_none() {
+        let m = ModelInfo {
+            id: "x".to_string(),
+            name: "X".to_string(),
+            params: 1.0,
+            hf_model: None,
+            hf_verified: None,
+        };
+        let obj = serde_json::to_value(&m).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(!obj.contains_key("hfModel"));
+        assert!(!obj.contains_key("hfVerified"));
+    }
 }
