@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -87,11 +88,29 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
     wait_until_ready(opts.port, opts.api_key, Duration::from_secs(240))
         .context("llama-server did not become ready")?;
 
+    let total: u32 = PROMPTS
+        .iter()
+        .map(|s| opts.max_turns.min(s.turns.len() as u32) * opts.reps)
+        .sum();
+    let tty = std::io::stderr().is_terminal();
+    let mut done = 0u32;
+
     let mut runs = Vec::new();
     for script in PROMPTS {
         let max = opts.max_turns.min(script.turns.len() as u32);
         for turns in 1..=max {
             for rep in 1..=opts.reps {
+                if tty {
+                    eprint!(
+                        "\r  generating {}/{}  ({}, {} turn{})…   ",
+                        done + 1,
+                        total,
+                        script.id,
+                        turns,
+                        if turns == 1 { "" } else { "s" }
+                    );
+                    let _ = std::io::stderr().flush();
+                }
                 // A server error/crash on a turn (e.g. the engine rejecting garbled
                 // output) is itself an invalidity signal — record it as a failed run
                 // rather than aborting the whole verification.
@@ -108,8 +127,12 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
                     output_preview: preview(&output),
                     gibberish,
                 });
+                done += 1;
             }
         }
+    }
+    if tty {
+        eprintln!("\r  generated {done}/{total} verification runs            ");
     }
 
     let valid = !runs.iter().any(|r| r.gibberish);

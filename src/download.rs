@@ -15,8 +15,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const UA: &str = concat!("llamabench-runner/", env!("CARGO_PKG_VERSION"));
 
@@ -155,11 +156,11 @@ pub fn hf_download(repo: &str, quant: &str) -> Result<PathBuf> {
     }
 
     eprintln!(
-        "↓ downloading {} from Hugging Face ({})…",
+        "  ↓ downloading {} from Hugging Face ({})…",
         hf.filename,
         expected.map(human).unwrap_or_else(|| "size unknown".into())
     );
-    stream_to_file(&hf.url, &dest)?;
+    stream_to_file(&hf.url, &dest, expected)?;
     if let Some(e) = expected {
         let got = fs::metadata(&dest)?.len();
         if got != e {
@@ -276,7 +277,7 @@ pub fn download_llama_cpp() -> Result<PathBuf> {
     fs::create_dir_all(&dest_dir).with_context(|| format!("creating {}", dest_dir.display()))?;
     let archive = dest_dir.join(&asset);
     eprintln!("↓ downloading llama.cpp {tag} ({asset})…");
-    stream_to_file(&url, &archive)?;
+    stream_to_file(&url, &archive, remote_len(&url))?;
     eprintln!("⇲ extracting {asset}…");
     extract(&archive, &dest_dir)?;
     let _ = fs::remove_file(&archive);
@@ -423,7 +424,7 @@ fn remote_len(url: &str) -> Option<u64> {
 
 /// Stream `url` to `dest` via a temporary `.part` file, then rename into place.
 /// Uses `io::copy` so the body never has to fit in memory.
-fn stream_to_file(url: &str, dest: &Path) -> Result<()> {
+fn stream_to_file(url: &str, dest: &Path, total: Option<u64>) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -437,11 +438,70 @@ fn stream_to_file(url: &str, dest: &Path) -> Result<()> {
         dest.file_name().and_then(|s| s.to_str()).unwrap_or("dl")
     ));
     let mut file = File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-    io::copy(&mut reader, &mut file).with_context(|| format!("streaming to {}", part.display()))?;
+    copy_with_progress(&mut reader, &mut file, total)
+        .with_context(|| format!("streaming to {}", part.display()))?;
     file.sync_all().ok();
     drop(file);
     fs::rename(&part, dest).with_context(|| format!("finalizing {}", dest.display()))?;
     Ok(())
+}
+
+/// Like `io::copy`, but draws a live progress bar to stderr (only on a TTY — piped/CI
+/// output gets the plain start/done lines, not a stream of carriage returns).
+fn copy_with_progress(
+    reader: &mut impl Read,
+    file: &mut impl Write,
+    total: Option<u64>,
+) -> io::Result<()> {
+    let tty = io::stderr().is_terminal();
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunks
+    let mut done: u64 = 0;
+    let start = Instant::now();
+    let mut last = Instant::now();
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        done += n as u64;
+        if tty && last.elapsed().as_millis() >= 150 {
+            draw_progress(done, total, start);
+            last = Instant::now();
+        }
+    }
+    if tty {
+        draw_progress(done, total, start);
+        eprintln!(); // finish the progress line
+    }
+    Ok(())
+}
+
+fn draw_progress(done: u64, total: Option<u64>, start: Instant) {
+    let secs = start.elapsed().as_secs_f64().max(0.001);
+    let speed = human((done as f64 / secs) as u64);
+    match total {
+        Some(t) if t > 0 => {
+            let frac = (done as f64 / t as f64).min(1.0);
+            let width = 28usize;
+            let filled = (frac * width as f64) as usize;
+            let bar = "█".repeat(filled) + &"░".repeat(width - filled);
+            let eta = if done > 0 {
+                let total_secs = secs / frac.max(1e-9);
+                format!("{:>4.0}s left", (total_secs - secs).max(0.0))
+            } else {
+                "  ?s left".into()
+            };
+            eprint!(
+                "\r  [{bar}] {:>5.1}%  {}/{}  {speed}/s  {eta}   ",
+                frac * 100.0,
+                human(done),
+                human(t)
+            );
+        }
+        _ => eprint!("\r  {}  {speed}/s   ", human(done)),
+    }
+    let _ = io::stderr().flush();
 }
 
 fn human(bytes: u64) -> String {

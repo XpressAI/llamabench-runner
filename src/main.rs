@@ -644,13 +644,14 @@ fn main() -> Result<()> {
             } else {
                 Some(resolve_token(&a)?)
             };
+            eprintln!("\n▸ [1/4] Model — resolve & download");
             let model = resolve_model(&a)?;
             let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             let quant = resolved_quant(&a, &model);
-            eprintln!("→ running llama-bench (speed)…");
+            eprintln!("\n▸ [2/4] Benchmark — llama-bench (prefill + decode)");
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             eprintln!(
-                "→ running output verification (llama-server, {} turns × {} reps)…",
+                "\n▸ [3/4] Verify — llama-server, {} turns × {} reps (the slow part)",
                 a.turns, a.reps
             );
             let v = run_verification(&verify_opts(&a, &dir, &model))?;
@@ -662,6 +663,7 @@ fn main() -> Result<()> {
             if !valid {
                 eprintln!("⚠ verification FAILED: gibberish detected — this result is INVALID");
             }
+            eprintln!("\n▸ [4/4] Submit");
             match token {
                 Some(token) => submit(&a.api, &token, &submission)?,
                 None => eprintln!("(dry run — not submitting)"),
