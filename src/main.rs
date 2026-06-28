@@ -74,6 +74,8 @@ struct RunArgs {
     /// Hugging Face repo for the GGUF, e.g. bartowski/Llama-3.1-8B-Instruct-GGUF
     /// (requires --quant). WITHOUT --model the file is downloaded from here; WITH
     /// --model the local file is used but its SHA-256 is verified against this repo.
+    /// The submission is attributed to the GGUF's base/finetune model (its HF
+    /// base_model) so every GGUF repack of the same model groups together.
     #[arg(long)]
     hf_model: Option<String>,
     /// Quantization to select/report, e.g. Q4_K_M. Required with --hf-model; with
@@ -183,30 +185,82 @@ fn resolve_model(a: &RunArgs) -> Result<String> {
     }
 }
 
-/// Hugging Face provenance recorded on the model: the source repo and whether the
-/// bytes are confirmed to come from it. Maps to `ModelInfo.hf_model` / `hf_verified`.
+/// The canonical model identity for a submission, resolved from a GGUF repo's HF
+/// `base_model` (one level up the model tree = the unquantized finetune/base it
+/// quantizes). Lets every GGUF repack of the same model group together. All fields are
+/// `None` when there's no `--hf-model` or no resolvable `base_model`, in which case the
+/// caller falls back to the per-quant llama-bench label.
+#[derive(Default)]
+struct Canonical {
+    /// The full canonical HF repo, e.g. `google/gemma-4-12b-it`. → `ModelInfo.base_model`.
+    base_model: Option<String>,
+    /// `slugify(<basename after '/'>)`, e.g. `gemma-4-12b-it`. → `ModelInfo.id`.
+    id: Option<String>,
+    /// The basename after '/', e.g. `gemma-4-12b-it`. → `ModelInfo.name`.
+    name: Option<String>,
+}
+
+/// Derive the canonical model id + name from a base_model repo: the basename after the
+/// last '/' is the `name`, and `slugify(basename)` is the `id`. e.g.
+/// `google/gemma-4-12b-it` → (`gemma-4-12b-it`, `gemma-4-12b-it`). A repo with no '/'
+/// is treated as its own basename. Returns `(id, name)`.
+fn canonical_id_name(base_model: &str) -> (String, String) {
+    let basename = base_model.rsplit('/').next().unwrap_or(base_model);
+    (detect::slugify(basename), basename.to_string())
+}
+
+/// Resolve the canonical model identity for a GGUF `repo` via its HF `base_model`. On
+/// success, prints a short line and returns the full base repo plus the derived
+/// id/name. An absent `base_model` or any network failure yields an empty `Canonical`
+/// (the run never fails over it; the caller keeps the llama-bench label).
+fn resolve_canonical(repo: &str) -> Canonical {
+    match download::hf_base_model(repo) {
+        Some(base) => {
+            let (id, name) = canonical_id_name(&base);
+            eprintln!("→ model: {name} (base of {repo})");
+            Canonical {
+                base_model: Some(base),
+                id: Some(id),
+                name: Some(name),
+            }
+        }
+        None => Canonical::default(),
+    }
+}
+
+/// Hugging Face provenance recorded on the model: the source repo, whether the bytes
+/// are confirmed to come from it, and the canonical (base/finetune) model identity it
+/// should be attributed to. Maps to `ModelInfo.hf_model` / `hf_verified` / `base_model`
+/// (and the canonical `id`/`name`).
 struct HfProvenance {
     model: Option<String>,
     verified: Option<bool>,
+    canonical: Canonical,
 }
 
 /// Decide the HF provenance for this run:
 /// * `--hf-model` alone (download path): the bytes came straight from the repo ⇒ verified.
 /// * `--model` + `--hf-model`: hash-verify the local file against the repo (`verify_hf_hash`).
 /// * `--model` alone: no provenance.
+///
+/// Whenever an `--hf-model` GGUF repo is given (either path), we also resolve its
+/// canonical model identity from the repo's `base_model` (see `resolve_canonical`).
 fn hf_provenance(a: &RunArgs, model: &str, quant: &str) -> HfProvenance {
     match (&a.model, &a.hf_model) {
         (None, Some(repo)) => HfProvenance {
             model: Some(repo.clone()),
             verified: Some(true),
+            canonical: resolve_canonical(repo),
         },
         (Some(_), Some(repo)) => HfProvenance {
             model: Some(repo.clone()),
             verified: Some(verify_hf_hash(model, repo, quant)),
+            canonical: resolve_canonical(repo),
         },
         _ => HfProvenance {
             model: None,
             verified: None,
+            canonical: Canonical::default(),
         },
     }
 }
@@ -362,7 +416,26 @@ fn build_submission(
         .first()
         .cloned()
         .unwrap_or_else(|| "CPU".to_string());
-    let name = model_name(model);
+    // Canonical model identity (from the GGUF's HF base_model) when we resolved one, so
+    // every GGUF repack of the same model groups together; otherwise fall back to the
+    // per-quant llama-bench label (slugified).
+    let HfProvenance {
+        model: hf_model,
+        verified: hf_verified,
+        canonical,
+    } = hf;
+    let Canonical {
+        base_model,
+        id: canonical_id,
+        name: canonical_name,
+    } = canonical;
+    let (model_id, name) = match (canonical_id, canonical_name) {
+        (Some(id), Some(name)) => (id, name),
+        _ => {
+            let label = model_name(model);
+            (detect::slugify(&label), label)
+        }
+    };
     let command = format!(
         "llama-bench -m {} -ngl {} -fa {} -ctk {} -ctv {} -p {} -n {}",
         model, a.ngl, a.fa, a.ctk, a.ctv, a.n_prompt, a.n_gen
@@ -377,11 +450,12 @@ fn build_submission(
             bandwidth_gbs: 0.0,
         },
         model: ModelInfo {
-            id: detect::slugify(&name),
+            id: model_id,
             name,
             params: b.params_b,
-            hf_model: hf.model,
-            hf_verified: hf.verified,
+            base_model,
+            hf_model,
+            hf_verified,
         },
         metrics: Metrics {
             decode_tps: b.decode_tps,
@@ -514,6 +588,22 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_identity_from_base_model() {
+        // org/name → basename `name`; id is the slug of the basename.
+        let (id, name) = canonical_id_name("google/gemma-4-12b-it");
+        assert_eq!(name, "gemma-4-12b-it");
+        assert_eq!(id, "gemma-4-12b-it");
+        // No slash → the whole repo string is its own basename.
+        let (id, name) = canonical_id_name("gemma-4-12b-it");
+        assert_eq!(name, "gemma-4-12b-it");
+        assert_eq!(id, "gemma-4-12b-it");
+        // Only the last path segment is the basename; the id is slugified.
+        let (id, name) = canonical_id_name("Org/Sub/Gemma 4 12B It");
+        assert_eq!(name, "Gemma 4 12B It");
+        assert_eq!(id, "gemma-4-12b-it");
+    }
 
     #[test]
     fn quant_parsing() {

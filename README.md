@@ -62,6 +62,12 @@ llamabench run --model /path/to/model.gguf --dry-run
   (streamed to a per-user cache, skipped if already present), picking the `.gguf`
   whose name matches the quant. `--quant` also sets the quant recorded in the result.
   Use `--model <path>` instead to point at a local file.
+- **Model attribution:** when you pass `--hf-model`, the submission is attributed to the
+  GGUF's **base/finetune model** (its Hugging Face `base_model`, e.g.
+  `unsloth/gemma-4-12b-it-GGUF` → `google/gemma-4-12b-it`) rather than the per-quant
+  llama-bench label, so every GGUF repack of the same model groups together on the
+  leaderboard. The repo is still recorded as provenance in `hfModel`. If no `base_model`
+  is published (or no `--hf-model` is given), the original per-quant label is kept.
 - **`--model <path> --hf-model <repo> --quant <Q>`** (given *together*) benchmarks the
   **local** file but records its Hugging Face provenance and verifies it: the runner
   streams the local file through SHA-256 and compares it against the repo's published

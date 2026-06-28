@@ -70,6 +70,38 @@ pub fn hf_resolve(repo: &str, quant: &str) -> Result<HfFile> {
     })
 }
 
+/// Resolve a GGUF repo's *base model* — one level up the HF model tree, i.e. the
+/// unquantized finetune this GGUF quantizes (or the base model when there's no
+/// finetune). HF exposes it as `cardData.base_model`, which is either a single string
+/// or an array of strings; we take the first non-empty entry. Returns `None` if it's
+/// absent or the repo is unreachable — resolving the canonical model identity must
+/// never fail the run. Hits only the lightweight model-metadata API (no blobs).
+pub fn hf_base_model(repo: &str) -> Option<String> {
+    let api = format!("https://huggingface.co/api/models/{repo}");
+    let resp = ureq::get(&api).set("User-Agent", UA).call().ok()?;
+    let v: Value = resp.into_json().ok()?;
+    base_model_from_value(&v)
+}
+
+/// Extract `cardData.base_model` from an HF model-metadata JSON value, accepting both
+/// shapes it ships in: a single string, or an array of strings (then the first
+/// non-empty, trimmed entry). Any other shape (absent, null, object) yields `None`.
+fn base_model_from_value(v: &Value) -> Option<String> {
+    match &v["cardData"]["base_model"] {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Resolve a repo's expected SHA-256 for the `.gguf` matching `quant`, via the HF
 /// **tree API** (`/api/models/<repo>/tree/main`). Each entry is `{path, size,
 /// lfs:{oid, size}}`; for an LFS-tracked GGUF the `lfs.oid` IS the file's sha256, so
@@ -499,6 +531,55 @@ mod tests {
         assert_eq!(human(512), "512 B");
         assert_eq!(human(1024), "1.0 KiB");
         assert_eq!(human(1_572_864), "1.5 MiB");
+    }
+
+    #[test]
+    fn base_model_string_shape() {
+        let v = serde_json::json!({
+            "cardData": { "base_model": "google/gemma-4-12b-it" }
+        });
+        assert_eq!(
+            base_model_from_value(&v).as_deref(),
+            Some("google/gemma-4-12b-it")
+        );
+    }
+
+    #[test]
+    fn base_model_array_shape_takes_first_non_empty() {
+        // Array form, and a leading empty entry should be skipped.
+        let v = serde_json::json!({
+            "cardData": { "base_model": ["", "google/gemma-4-12b-it", "other/thing"] }
+        });
+        assert_eq!(
+            base_model_from_value(&v).as_deref(),
+            Some("google/gemma-4-12b-it")
+        );
+    }
+
+    #[test]
+    fn base_model_absent_is_none() {
+        // No base_model under cardData.
+        let v = serde_json::json!({ "cardData": { "license": "gemma" } });
+        assert!(base_model_from_value(&v).is_none());
+        // No cardData at all.
+        let v2 = serde_json::json!({ "siblings": [] });
+        assert!(base_model_from_value(&v2).is_none());
+        // Present but empty / wrong type.
+        let v3 = serde_json::json!({ "cardData": { "base_model": "" } });
+        assert!(base_model_from_value(&v3).is_none());
+        let v4 = serde_json::json!({ "cardData": { "base_model": [] } });
+        assert!(base_model_from_value(&v4).is_none());
+    }
+
+    // Live smoke against the HF model API: resolve the real base_model of a GGUF repo
+    // *without downloading any blob*. Ignored by default (network).
+    #[test]
+    #[ignore = "network: hits the live Hugging Face API"]
+    fn hf_base_model_live() {
+        let base = hf_base_model("unsloth/gemma-3-12b-it-GGUF")
+            .expect("the GGUF repo should expose a base_model");
+        assert!(base.contains('/'), "base_model is a repo path: {base}");
+        eprintln!("base_model: {base}");
     }
 
     // Live smoke against the Hugging Face API. Ignored by default (network); run with

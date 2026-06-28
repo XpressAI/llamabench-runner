@@ -23,6 +23,12 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub params: f64,
+    /// The canonical model this submission is attributed to: the HF repo one level up
+    /// the GGUF's model tree — the unquantized finetune it quantizes, or the base model
+    /// when there's no finetune (e.g. `google/gemma-4-12b-it`). Lets every GGUF repack
+    /// of the same model group together. Omitted when there's no `--hf-model` base.
+    #[serde(rename = "baseModel", skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
     /// Source Hugging Face repo this model is attributed to (download path, or a
     /// local `--model` paired with `--hf-model`). Omitted for an unattributed local file.
     #[serde(rename = "hfModel", skip_serializing_if = "Option::is_none")]
@@ -128,14 +134,16 @@ mod tests {
     #[test]
     fn model_info_serializes_hf_fields() {
         let m = ModelInfo {
-            id: "x".to_string(),
-            name: "X".to_string(),
+            id: "gemma-4-12b-it".to_string(),
+            name: "gemma-4-12b-it".to_string(),
             params: 1.0,
-            hf_model: Some("bartowski/Foo-GGUF".to_string()),
+            base_model: Some("google/gemma-4-12b-it".to_string()),
+            hf_model: Some("unsloth/gemma-4-12b-it-GGUF".to_string()),
             hf_verified: Some(true),
         };
         let j = serde_json::to_value(&m).unwrap();
-        assert_eq!(j["hfModel"], "bartowski/Foo-GGUF");
+        assert_eq!(j["baseModel"], "google/gemma-4-12b-it");
+        assert_eq!(j["hfModel"], "unsloth/gemma-4-12b-it-GGUF");
         assert_eq!(j["hfVerified"], true);
     }
 
@@ -145,11 +153,13 @@ mod tests {
             id: "x".to_string(),
             name: "X".to_string(),
             params: 1.0,
+            base_model: None,
             hf_model: None,
             hf_verified: None,
         };
         let obj = serde_json::to_value(&m).unwrap();
         let obj = obj.as_object().unwrap();
+        assert!(!obj.contains_key("baseModel"));
         assert!(!obj.contains_key("hfModel"));
         assert!(!obj.contains_key("hfVerified"));
     }
