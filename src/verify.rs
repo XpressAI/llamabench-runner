@@ -55,6 +55,18 @@ pub struct VerifyOpts<'a> {
     pub extra_server_args: Vec<String>,
 }
 
+/// A llama-server to verify against — either one we spawned (`run_verification`) or
+/// the user's own drop-in `llamabench llama-server` process (ADR-009). `api_key` is
+/// only sent when the server actually requires one.
+pub struct VerifySession<'a> {
+    pub port: u16,
+    pub api_key: Option<&'a str>,
+    pub seed: u64,
+    pub n_gen: u32,
+    pub max_turns: u32,
+    pub reps: u32,
+}
+
 /// Kills the spawned server on drop so we never leak a process.
 struct ServerGuard(Child);
 impl Drop for ServerGuard {
@@ -85,21 +97,33 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
         .with_context(|| format!("spawning {}", bin.display()))?;
     let _guard = ServerGuard(child);
 
-    wait_until_ready(opts.port, opts.api_key, Duration::from_secs(240))
+    wait_until_ready(opts.port, Some(opts.api_key), Duration::from_secs(240))
         .context("llama-server did not become ready")?;
 
+    verify_running(&VerifySession {
+        port: opts.port,
+        api_key: Some(opts.api_key),
+        seed: opts.seed,
+        n_gen: opts.n_gen,
+        max_turns: opts.max_turns,
+        reps: opts.reps,
+    })
+}
+
+/// The verification matrix against an already-running server.
+pub fn verify_running(s: &VerifySession) -> Result<Verification> {
     let total: u32 = PROMPTS
         .iter()
-        .map(|s| opts.max_turns.min(s.turns.len() as u32) * opts.reps)
+        .map(|script| s.max_turns.min(script.turns.len() as u32) * s.reps)
         .sum();
     let tty = std::io::stderr().is_terminal();
     let mut done = 0u32;
 
     let mut runs = Vec::new();
     for script in PROMPTS {
-        let max = opts.max_turns.min(script.turns.len() as u32);
+        let max = s.max_turns.min(script.turns.len() as u32);
         for turns in 1..=max {
-            for rep in 1..=opts.reps {
+            for rep in 1..=s.reps {
                 if tty {
                     eprint!(
                         "\r  generating {}/{}  ({}, {} turn{})…   ",
@@ -114,7 +138,7 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
                 // A server error/crash on a turn (e.g. the engine rejecting garbled
                 // output) is itself an invalidity signal — record it as a failed run
                 // rather than aborting the whole verification.
-                let (output, failed) = match run_conversation(opts, script, turns) {
+                let (output, failed) = match run_conversation(s, script, turns) {
                     Ok(o) => (o, false),
                     Err(e) => (format!("<engine error: {e}>"), true),
                 };
@@ -137,9 +161,9 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
 
     let valid = !runs.iter().any(|r| r.gibberish);
     Ok(Verification {
-        seed: opts.seed,
+        seed: s.seed,
         temperature: 0.0,
-        n_gen: opts.n_gen,
+        n_gen: s.n_gen,
         valid,
         runs,
     })
@@ -152,12 +176,12 @@ struct Reply {
 
 /// Generate a `turns`-deep conversation, returning the final turn's full output
 /// (reasoning trace + answer) for hashing/gibberish-checking.
-fn run_conversation(opts: &VerifyOpts, script: &PromptScript, turns: u32) -> Result<String> {
+fn run_conversation(s: &VerifySession, script: &PromptScript, turns: u32) -> Result<String> {
     let mut messages: Vec<Value> = Vec::new();
     let mut final_output = String::new();
     for i in 0..turns as usize {
         messages.push(json!({"role": "user", "content": script.turns[i]}));
-        let reply = chat(opts, &messages)?;
+        let reply = chat(s, &messages)?;
         // Conversation history carries the answer (or the reasoning if the answer is
         // empty, e.g. budget-truncated) so later turns have context.
         let history = if reply.content.is_empty() {
@@ -177,17 +201,20 @@ fn run_conversation(opts: &VerifyOpts, script: &PromptScript, turns: u32) -> Res
 
 /// One chat completion. Reasoning models split output into `reasoning_content` +
 /// `content`; we capture both.
-fn chat(opts: &VerifyOpts, messages: &[Value]) -> Result<Reply> {
-    let url = format!("http://127.0.0.1:{}/v1/chat/completions", opts.port);
+fn chat(s: &VerifySession, messages: &[Value]) -> Result<Reply> {
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", s.port);
     let body = json!({
         "messages": messages,
-        "seed": opts.seed,
+        "seed": s.seed,
         "temperature": 0.0,
-        "max_tokens": opts.n_gen,
+        "max_tokens": s.n_gen,
         "stream": false,
     });
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", opts.api_key))
+    let mut req = ureq::post(&url);
+    if let Some(key) = s.api_key {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+    let resp = req
         .send_json(body)
         .map_err(|e| anyhow::anyhow!("chat request failed: {e}"))?;
     let v: Value = resp.into_json().context("decoding chat response")?;
@@ -201,16 +228,15 @@ fn chat(opts: &VerifyOpts, messages: &[Value]) -> Result<Reply> {
     })
 }
 
-fn wait_until_ready(port: u16, api_key: &str, timeout: Duration) -> Result<()> {
+pub fn wait_until_ready(port: u16, api_key: Option<&str>, timeout: Duration) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}/health");
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let ok = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .timeout(Duration::from_secs(5))
-            .call()
-            .map(|r| r.status() == 200)
-            .unwrap_or(false);
+        let mut req = ureq::get(&url).timeout(Duration::from_secs(5));
+        if let Some(key) = api_key {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+        let ok = req.call().map(|r| r.status() == 200).unwrap_or(false);
         if ok {
             return Ok(());
         }

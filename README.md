@@ -21,24 +21,68 @@ from the [Releases page](../../releases) and drop the binary somewhere on your P
 
 Supported prebuilt targets: Linux x86_64, macOS (Intel + Apple Silicon), Windows x86_64.
 
-## Usage
+## Usage — drop in for llama-bench / llama-server
+
+Take the command you already run and swap the program name. Your **exact
+configuration** is benchmarked, verified, recorded verbatim as the reproduce
+command, and submitted:
 
 ```sh
-llamabench --help
-
-# 1. Save your token once — it's stored in your per-user config dir, so later
-#    `run`s submit without --token. (Get one at https://llamabench.ai/account.)
+# 1. Save your token once (get one at https://llamabench.ai/account).
 llamabench auth <token>
 
-# 2. Easiest full run: fetch the model from Hugging Face AND a prebuilt llama.cpp,
-#    benchmark, verify, and submit — no local setup required.
+# 2a. You run llama-bench? Drop the dash:
+#       llama-bench -m model.gguf -ngl 99 -fa on -ub 2048 -ot "ffn=CPU"
+llamabench -m model.gguf -ngl 99 -fa on -ub 2048 -ot "ffn=CPU"
+
+# 2b. You run llama-server? Prefix it:
+#       llama-server -m model.gguf -c 8192 -np 2 --jinja
+llamabench llama-server -m model.gguf -c 8192 -np 2 --jinja
+```
+
+Every flag is passed through to the real tool untouched (matrix runs like
+`-ngl 0,99` submit one result per configuration). llamabench adds its own flags
+on top — they never collide with llama.cpp's: `--dry-run` (don't submit),
+`--no-verify` (skip the output-correctness pass), `--token <t>`,
+`--handle <@you>`, `--family <fork>`, `--llama-dir <bin-dir>`, `--api <url>`,
+`--download-llama`. Bare `llamabench <flags>` picks the tool automatically
+(server-only flags like `--port`/`-c` ⇒ llama-server); force it with
+`llamabench llama-bench …` or `llamabench llama-server …`.
+
+In llama-bench mode the speed table you know streams as usual and the numbers
+are read from llama-bench's own per-test output (`-oe jsonl` is appended). In
+llama-server mode the server runs with your args verbatim and prefill/decode/TTFT
+come from the server's own `timings` on standardized requests (temp 0, ~512-token
+prompt, 128 generated tokens, median of 3).
+
+### Link local GGUFs to Hugging Face (hash-verified)
+
+Tell llamabench once where a local file came from — it streams the file through
+SHA-256 and matches it against the repo's published LFS hashes (no download):
+
+```sh
+llamabench link ./gemma-4-12b-it-UD-Q4_K_XL.gguf unsloth/gemma-4-12b-it-GGUF
+#   ✓ hash verified: gemma-4-12b-it-UD-Q4_K_XL.gguf is unsloth/gemma-4-12b-it-GGUF/...
+llamabench link --list            # show all links
+llamabench link --forget <path>   # remove one
+```
+
+From then on every run of that file — drop-in or classic — carries `hfModel` +
+`hfVerified` provenance and is attributed to the GGUF's canonical base model, with
+no extra flags. If the file changes (size/mtime), it's re-hashed and re-verified
+automatically; a hash that stops matching records `hfVerified: false`, never a
+failed run.
+
+### Classic subcommands
+
+The original flag-based interface still works (and is what the submit page
+generates):
+
+```sh
+# Fetch the model from Hugging Face AND a prebuilt llama.cpp — no local setup:
 llamabench run --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M --download-llama
 
-# Already have a llama.cpp build? Point at it instead of --download-llama:
-llamabench run --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M \
-  --llama-dir /path/to/llama.cpp/build/bin
-
-# Or use a local model file:
+# Local model + your own llama.cpp build:
 llamabench run --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/bin
 
 # Benchmarking a llama.cpp fork? Name it with --family so the result is recorded
@@ -47,18 +91,13 @@ llamabench run --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/
 llamabench run --model /path/to/model.gguf \
   --family ik_llama.cpp --llama-dir /path/to/ik_llama.cpp/build/bin
 
-# Use a LOCAL file but attribute + hash-verify its Hugging Face provenance
-# (records the repo and a ✓/⚠ verified flag; the local bytes are what's benchmarked):
+# One-off provenance without a persistent link (hash-verified this run only):
 llamabench run --model /path/to/Llama-3.1-8B-Instruct-Q4_K_M.gguf \
   --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M
 
-# Speed only — run llama-bench and print the numbers:
-llamabench bench --model /path/to/model.gguf --llama-dir /path/to/llama.cpp/build/bin
-
-# Output-correctness verification against llama-server (fixed seed, temp 0, multi-turn):
+# Speed only / verification only / build-but-don't-submit:
+llamabench bench --model /path/to/model.gguf
 llamabench verify --model /path/to/model.gguf
-
-# Build the result without submitting (no token required):
 llamabench run --model /path/to/model.gguf --dry-run
 ```
 

@@ -103,22 +103,42 @@ fn base_model_from_value(v: &Value) -> Option<String> {
     }
 }
 
-/// Resolve a repo's expected SHA-256 for the `.gguf` matching `quant`, via the HF
-/// **tree API** (`/api/models/<repo>/tree/main`). Each entry is `{path, size,
-/// lfs:{oid, size}}`; for an LFS-tracked GGUF the `lfs.oid` IS the file's sha256, so
-/// it lets us verify a local file's provenance without downloading the blob. Returns
-/// `Ok(None)` when no `.gguf` matches the quant (or the match isn't LFS-tracked, so
-/// no oid is published).
-pub fn hf_expected_sha256(repo: &str, quant: &str) -> Result<Option<String>> {
+/// Fetch a repo's file tree via the HF **tree API** (`/api/models/<repo>/tree/main`).
+/// Each entry is `{path, size, lfs:{oid, size}}`; for an LFS-tracked file the
+/// `lfs.oid` IS the file's sha256, so provenance can be verified without
+/// downloading any blob.
+fn hf_tree(repo: &str) -> Result<Vec<Value>> {
     let api = format!("https://huggingface.co/api/models/{repo}/tree/main");
     let resp = ureq::get(&api)
         .set("User-Agent", UA)
         .call()
         .map_err(|e| anyhow!("Hugging Face tree API request failed for '{repo}': {e}"))?;
     let v: Value = resp.into_json().context("decoding HF tree metadata")?;
-    let entries = v
-        .as_array()
-        .ok_or_else(|| anyhow!("unexpected HF tree API response for '{repo}' (not a list)"))?;
+    v.as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("unexpected HF tree API response for '{repo}' (not a list)"))
+}
+
+/// Find the repo file whose published LFS sha256 equals `sha256` (case-insensitive).
+/// This is the `llamabench link` verification: a match proves the local bytes are
+/// exactly that repo file. Returns `Ok(None)` when nothing in the repo matches.
+pub fn hf_file_by_sha256(repo: &str, sha256: &str) -> Result<Option<String>> {
+    let entries = hf_tree(repo)?;
+    Ok(entries.iter().find_map(|e| {
+        let oid = e["lfs"]["oid"].as_str()?;
+        if oid.eq_ignore_ascii_case(sha256) {
+            e["path"].as_str().map(str::to_string)
+        } else {
+            None
+        }
+    }))
+}
+
+/// Resolve a repo's expected SHA-256 for the `.gguf` matching `quant`. Returns
+/// `Ok(None)` when no `.gguf` matches the quant (or the match isn't LFS-tracked, so
+/// no oid is published).
+pub fn hf_expected_sha256(repo: &str, quant: &str) -> Result<Option<String>> {
+    let entries = hf_tree(repo)?;
     let ggufs: Vec<String> = entries
         .iter()
         .filter_map(|e| e["path"].as_str())
@@ -134,6 +154,18 @@ pub fn hf_expected_sha256(repo: &str, quant: &str) -> Result<Option<String>> {
         .and_then(|e| e["lfs"]["oid"].as_str())
         .map(str::to_string);
     Ok(oid)
+}
+
+/// Whether a repo publishes any LFS-tracked `.gguf` at all — used to phrase the
+/// `link` failure message (an empty repo vs. a genuine hash mismatch).
+pub fn hf_has_gguf(repo: &str) -> bool {
+    hf_tree(repo).is_ok_and(|entries| {
+        entries.iter().any(|e| {
+            e["path"]
+                .as_str()
+                .is_some_and(|p| p.to_lowercase().ends_with(".gguf"))
+        })
+    })
 }
 
 /// Resolve, then stream the model to the cache (skipping if already present at the
@@ -448,7 +480,8 @@ fn stream_to_file(url: &str, dest: &Path, total: Option<u64>) -> Result<()> {
 
 /// Like `io::copy`, but draws a live progress bar to stderr (only on a TTY — piped/CI
 /// output gets the plain start/done lines, not a stream of carriage returns).
-fn copy_with_progress(
+/// Public because `link` reuses it to show progress while hashing a multi-GB GGUF.
+pub fn copy_with_progress(
     reader: &mut impl Read,
     file: &mut impl Write,
     total: Option<u64>,

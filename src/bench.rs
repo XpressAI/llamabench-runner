@@ -209,7 +209,8 @@ fn parse_build(line: &str) -> Option<(String, String)> {
 ///   Vulkan/SYCL: "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..."
 ///   Metal:       "ggml_metal_init: picking default device: Apple M4" / "GPU name: Apple M4"
 ///   CUDA/HIP:    "  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes"
-fn parse_device(line: &str) -> Option<String> {
+/// Public: the drop-in modes scan the streams of the processes they spawn with it.
+pub fn parse_device(line: &str) -> Option<String> {
     let l = line.trim();
 
     if l.starts_with("ggml_") {
