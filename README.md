@@ -50,7 +50,9 @@ on top — they never collide with llama.cpp's: `--dry-run` (don't submit),
 `llamabench llama-bench …` or `llamabench llama-server …`.
 
 In llama-bench mode the speed table you know streams as usual and the numbers
-are read from llama-bench's own per-test output (`-oe jsonl` is appended). In
+are read from llama-bench's own per-test output (`-oe jsonl` is appended); TTFT
+is probed on the verification server with the same standardized ~512-token
+prompt the server mode uses, so the two modes' TTFTs are comparable. In
 llama-server mode the server runs with your args verbatim and prefill/decode/TTFT
 come from the server's own `timings` on standardized requests (temp 0, ~512-token
 prompt, 128 generated tokens, median of 3).

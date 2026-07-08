@@ -17,7 +17,7 @@
 //! passthrough; none collide with llama.cpp flag names.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::bench::{self, BenchResult};
 use crate::submitter::{self, build_submission, BuildCtx, Family, ModelSource};
-use crate::verify::{self, VerifyOpts, VerifySession};
+use crate::verify::{self, Timing, VerifyOpts, VerifySession};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -593,11 +593,15 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
                 g.skipped_rows
             );
         }
-        let verification = if w.no_verify {
-            None
+        // The verification pass already pays for a running llama-server at this
+        // group's config, so TTFT (standardized ~512-token prompt) rides along.
+        let (verification, ttft_ms) = if w.no_verify {
+            (None, None)
         } else {
-            eprintln!("\n▸ [2/3] Verify — llama-server, 3 turns × 3 reps (the slow part)");
-            match verify::run_verification(&VerifyOpts {
+            eprintln!(
+                "\n▸ [2/3] Verify — llama-server, TTFT probe + 3 turns × 3 reps (the slow part)"
+            );
+            match verify::run_verification_with_ttft(&VerifyOpts {
                 server_bin_dir: &dir,
                 model: &g.model_file,
                 port: 8080,
@@ -608,13 +612,13 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
                 reps: 3,
                 extra_server_args: verify_args_for(g),
             }) {
-                Ok(v) => Some(v),
+                Ok((v, ttft)) => (Some(v), ttft),
                 Err(e) => {
                     eprintln!(
                         "⚠ verification could not run ({e}) — submitting without a verification \
                          block (pass --no-verify to skip this step explicitly)"
                     );
-                    None
+                    (None, None)
                 }
             }
         };
@@ -629,7 +633,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             model_path: &g.model_file,
             context_length: g.context_length,
             spec_decode: "none".to_string(),
-            ttft_ms: None,
+            ttft_ms,
         };
         let invalid = verification.as_ref().is_some_and(|v| !v.valid);
         let mut s = build_submission(&ctx, &g.bench, verification, hf);
@@ -660,66 +664,16 @@ impl Drop for KillOnDrop {
     }
 }
 
-struct Timing {
-    prefill: f64,
-    decode: f64,
-    prompt_ms: f64,
-}
-
-fn http_completion(
-    port: u16,
-    api_key: Option<&str>,
-    prompt: &str,
-    n_predict: u32,
-) -> Result<Timing> {
-    let url = format!("http://127.0.0.1:{port}/completion");
-    let body = json!({
-        "prompt": prompt,
-        "n_predict": n_predict,
-        "temperature": 0.0,
-        "seed": 42,
-        "cache_prompt": false,
-    });
-    let mut req = ureq::post(&url).timeout(Duration::from_secs(600));
-    if let Some(key) = api_key {
-        req = req.set("Authorization", &format!("Bearer {key}"));
-    }
-    let resp = req
-        .send_json(body)
-        .map_err(|e| anyhow!("completion request failed: {e}"))?;
-    let v: Value = resp.into_json().context("decoding completion response")?;
-    let t = &v["timings"];
-    let timing = Timing {
-        prefill: t["prompt_per_second"].as_f64().unwrap_or(0.0),
-        decode: t["predicted_per_second"].as_f64().unwrap_or(0.0),
-        prompt_ms: t["prompt_ms"].as_f64().unwrap_or(0.0),
-    };
-    if timing.decode == 0.0 {
-        bail!(
-            "the server response carried no timings — can't measure speed (keys: {})",
-            v.as_object()
-                .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
-                .unwrap_or_default()
-        );
-    }
-    Ok(timing)
-}
-
-/// Standardized speed through the running server: a ~512-token fixed prompt,
+/// Standardized speed through the running server: the fixed ~512-token prompt,
 /// 128 generated tokens, temp 0 — one warmup, then the median-by-decode of 3 reps.
 /// The rates are the server's own `timings`, i.e. exactly what the user's
 /// configuration delivers.
 fn measure_speed(port: u16, api_key: Option<&str>) -> Result<Timing> {
-    let para = "The library at the edge of town kept its lights on long after closing, \
-        because the archivist believed that somewhere between the shelves a reader was \
-        always lost, tracing the margins of a book that had waited decades to be opened, \
-        and she considered it her duty to keep the lamps burning until every last one of \
-        them found the door. ";
-    let prompt = para.repeat(8);
-    let _ = http_completion(port, api_key, &prompt, 16).context("warmup request failed")?;
+    let prompt = verify::standard_prompt();
+    let _ = verify::http_completion(port, api_key, &prompt, 16).context("warmup request failed")?;
     let mut reps = Vec::new();
     for i in 1..=3 {
-        let t = http_completion(port, api_key, &prompt, 128)?;
+        let t = verify::http_completion(port, api_key, &prompt, 128)?;
         eprintln!(
             "  rep {i}: prefill {:.1} t/s · decode {:.1} t/s · ttft {:.0} ms",
             t.prefill, t.decode, t.prompt_ms
@@ -942,6 +896,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

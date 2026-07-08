@@ -284,8 +284,11 @@ fn classic_submission(
     b: &BenchResult,
     v: Option<Verification>,
     hf: HfProvenance,
+    ttft_ms: Option<u32>,
 ) -> contract::ResultSubmission {
-    build_submission(&classic_ctx(a, model, quant), b, v, hf)
+    let mut ctx = classic_ctx(a, model, quant);
+    ctx.ttft_ms = ttft_ms;
+    build_submission(&ctx, b, v, hf)
 }
 
 fn main() -> Result<()> {
@@ -340,7 +343,7 @@ fn main() -> Result<()> {
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let hf = provenance(&model_source(&a, &model), &quant);
-            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf))?;
+            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None))?;
         }
         Command::Verify(a) => {
             let model = resolve_model(&a)?;
@@ -366,13 +369,13 @@ fn main() -> Result<()> {
             eprintln!("\n▸ [2/4] Benchmark — llama-bench (prefill + decode)");
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             eprintln!(
-                "\n▸ [3/4] Verify — llama-server, {} turns × {} reps (the slow part)",
+                "\n▸ [3/4] Verify — llama-server, TTFT probe + {} turns × {} reps (the slow part)",
                 a.turns, a.reps
             );
-            let v = run_verification(&verify_opts(&a, &dir, &model))?;
+            let (v, ttft) = verify::run_verification_with_ttft(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
             let hf = provenance(&model_source(&a, &model), &quant);
-            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf);
+            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft);
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
             if !valid {

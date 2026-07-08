@@ -76,7 +76,18 @@ impl Drop for ServerGuard {
     }
 }
 
-pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
+fn session_of<'a>(opts: &'a VerifyOpts) -> VerifySession<'a> {
+    VerifySession {
+        port: opts.port,
+        api_key: Some(opts.api_key),
+        seed: opts.seed,
+        n_gen: opts.n_gen,
+        max_turns: opts.max_turns,
+        reps: opts.reps,
+    }
+}
+
+fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
     let bin = Path::new(opts.server_bin_dir).join("llama-server");
     let port = opts.port.to_string();
     let mut cmd = Command::new(&bin);
@@ -95,19 +106,28 @@ pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
     let child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    let _guard = ServerGuard(child);
-
+    let guard = ServerGuard(child);
     wait_until_ready(opts.port, Some(opts.api_key), Duration::from_secs(240))
         .context("llama-server did not become ready")?;
+    Ok(guard)
+}
 
-    verify_running(&VerifySession {
-        port: opts.port,
-        api_key: Some(opts.api_key),
-        seed: opts.seed,
-        n_gen: opts.n_gen,
-        max_turns: opts.max_turns,
-        reps: opts.reps,
-    })
+pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
+    let _guard = spawn_server(opts)?;
+    verify_running(&session_of(opts))
+}
+
+/// Verification plus a TTFT reading from the same server (the fixed-prompt pass is
+/// already paying for a running llama-server, so the standardized probe rides
+/// along). Returns `None` TTFT when the probe fails — never fails the run over it.
+pub fn run_verification_with_ttft(opts: &VerifyOpts) -> Result<(Verification, Option<u32>)> {
+    let _guard = spawn_server(opts)?;
+    let ttft = ttft_probe(opts.port, Some(opts.api_key));
+    if let Some(ms) = ttft {
+        eprintln!("  ttft {ms} ms (standardized ~512-token prompt via llama-server)");
+    }
+    let v = verify_running(&session_of(opts))?;
+    Ok((v, ttft))
 }
 
 /// The verification matrix against an already-running server.
@@ -228,6 +248,87 @@ fn chat(s: &VerifySession, messages: &[Value]) -> Result<Reply> {
     })
 }
 
+/// The standardized speed/TTFT prompt: fixed text, ~512 tokens once repeated, so
+/// every rig measures the same work. Used by the llama-server drop-in's speed pass
+/// and the TTFT probe that rides on the verification server.
+pub fn standard_prompt() -> String {
+    "The library at the edge of town kept its lights on long after closing, \
+     because the archivist believed that somewhere between the shelves a reader was \
+     always lost, tracing the margins of a book that had waited decades to be opened, \
+     and she considered it her duty to keep the lamps burning until every last one of \
+     them found the door. "
+        .repeat(8)
+}
+
+/// The server's own timings for one `/completion` call.
+pub struct Timing {
+    pub prefill: f64,
+    pub decode: f64,
+    pub prompt_ms: f64,
+}
+
+pub fn http_completion(
+    port: u16,
+    api_key: Option<&str>,
+    prompt: &str,
+    n_predict: u32,
+) -> Result<Timing> {
+    let url = format!("http://127.0.0.1:{port}/completion");
+    let body = json!({
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "temperature": 0.0,
+        "seed": 42,
+        "cache_prompt": false,
+    });
+    let mut req = ureq::post(&url).timeout(Duration::from_secs(600));
+    if let Some(key) = api_key {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+    let resp = req
+        .send_json(body)
+        .map_err(|e| anyhow::anyhow!("completion request failed: {e}"))?;
+    let v: Value = resp.into_json().context("decoding completion response")?;
+    let t = &v["timings"];
+    let timing = Timing {
+        prefill: t["prompt_per_second"].as_f64().unwrap_or(0.0),
+        decode: t["predicted_per_second"].as_f64().unwrap_or(0.0),
+        prompt_ms: t["prompt_ms"].as_f64().unwrap_or(0.0),
+    };
+    if timing.decode == 0.0 {
+        bail!(
+            "the server response carried no timings — can't measure speed (keys: {})",
+            v.as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default()
+        );
+    }
+    Ok(timing)
+}
+
+/// The median of `prompt_ms` samples, rounded to whole ms. `None` when empty.
+pub fn median_ms(mut samples: Vec<f64>) -> Option<u32> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f64::total_cmp);
+    Some(samples[samples.len() / 2].round() as u32)
+}
+
+/// TTFT against a running server: one warmup, then the median `prompt_ms` of 3
+/// standardized-prompt completions (`n_predict` is tiny — only the prefill matters).
+/// Best-effort: any failure yields `None`, never a failed run.
+pub fn ttft_probe(port: u16, api_key: Option<&str>) -> Option<u32> {
+    let prompt = standard_prompt();
+    http_completion(port, api_key, &prompt, 8).ok()?;
+    median_ms(
+        (0..3)
+            .filter_map(|_| http_completion(port, api_key, &prompt, 8).ok())
+            .map(|t| t.prompt_ms)
+            .collect(),
+    )
+}
+
 pub fn wait_until_ready(port: u16, api_key: Option<&str>, timeout: Duration) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}/health");
     let start = Instant::now();
@@ -306,6 +407,14 @@ mod tests {
              relationships, growth, contribution, and the pursuit of understanding."
         ));
         assert!(!is_gibberish("1, 2, 3, 4, 5, 6, 7, 8, 9, 10"));
+    }
+
+    #[test]
+    fn median_of_prompt_ms_samples() {
+        assert_eq!(median_ms(vec![]), None);
+        assert_eq!(median_ms(vec![2326.4]), Some(2326));
+        // Median (not mean) so one slow outlier can't skew the recorded TTFT.
+        assert_eq!(median_ms(vec![2654.0, 2326.0, 9999.0]), Some(2654));
     }
 
     #[test]
