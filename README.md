@@ -55,23 +55,23 @@ llama-server mode the server runs with your args verbatim and prefill/decode/TTF
 come from the server's own `timings` on standardized requests (temp 0, ~512-token
 prompt, 128 generated tokens, median of 3).
 
-### Link local GGUFs to Hugging Face (hash-verified)
+### Hugging Face provenance — automatic, verified on the site
 
-Tell llamabench once where a local file came from — it streams the file through
-SHA-256 and matches it against the repo's published LFS hashes (no download):
+Every submission of a local file records the GGUF's **SHA-256** (hashed once per
+file, then cached by size/mtime). Linking that file to the Hugging Face repo it
+came from happens **on llamabench.ai**: open the result and name the repo — the
+server verifies the hash against the repo's published LFS hashes and, once one
+person has linked a file, every past and future submission of the same bytes is
+attributed automatically. Nothing to do in the CLI.
+
+Prefer to pin provenance locally (offline / scripted runs)? The CLI link store
+still works and takes precedence:
 
 ```sh
 llamabench link ./gemma-4-12b-it-UD-Q4_K_XL.gguf unsloth/gemma-4-12b-it-GGUF
-#   ✓ hash verified: gemma-4-12b-it-UD-Q4_K_XL.gguf is unsloth/gemma-4-12b-it-GGUF/...
 llamabench link --list            # show all links
 llamabench link --forget <path>   # remove one
 ```
-
-From then on every run of that file — drop-in or classic — carries `hfModel` +
-`hfVerified` provenance and is attributed to the GGUF's canonical base model, with
-no extra flags. If the file changes (size/mtime), it's re-hashed and re-verified
-automatically; a hash that stops matching records `hfVerified: false`, never a
-failed run.
 
 ### Classic subcommands
 

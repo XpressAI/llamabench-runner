@@ -30,12 +30,24 @@ pub struct LinkEntry {
     pub verified: bool,
 }
 
+/// A cached file hash (no repo claim — that's a `LinkEntry`). Lets every run
+/// record `ggufSha256` (ADR-010) without re-hashing a multi-GB file: valid while
+/// `size`/`mtime` are unchanged.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HashEntry {
+    pub sha256: String,
+    pub size: u64,
+    pub mtime: i64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct ConfigFile {
     #[serde(default)]
     token: String,
     #[serde(default)]
     links: BTreeMap<String, LinkEntry>,
+    #[serde(default)]
+    hashes: BTreeMap<String, HashEntry>,
 }
 
 /// `dirs::config_dir()/llamabench/config.json` (or `$LLAMABENCH_CONFIG_DIR/config.json`).
@@ -113,6 +125,19 @@ pub fn remove_link(path_key: &str) -> Result<bool> {
         save(&cfg)?;
     }
     Ok(existed)
+}
+
+/// The cached hash for `path_key`, if any.
+pub fn cached_hash(path_key: &str) -> Option<HashEntry> {
+    load().hashes.get(path_key).cloned()
+}
+
+/// Insert or replace the hash cache entry for `path_key`.
+pub fn store_hash(path_key: &str, entry: HashEntry) -> Result<()> {
+    let mut cfg = load();
+    cfg.hashes.insert(path_key.to_string(), entry);
+    save(&cfg)?;
+    Ok(())
 }
 
 #[cfg(test)]

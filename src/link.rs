@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use crate::config::{self, LinkEntry};
+use crate::config::{self, HashEntry, LinkEntry};
 use crate::download;
 
 /// A link resolved for a run: the repo to attribute, and whether the local bytes
@@ -174,6 +174,44 @@ pub fn cmd_forget(path: &str) -> Result<()> {
     } else {
         bail!("no link stored for {key}")
     }
+}
+
+/// The model file's SHA-256 for `model.ggufSha256` (ADR-010) — every submission of
+/// a local file carries it so the server (and one web link) can attach provenance.
+/// Sources, cheapest first: a stored link whose size/mtime still match, the hash
+/// cache, else a fresh streaming hash (once — cached afterwards). Never fails a
+/// run: any error yields `None`.
+pub fn sha256_for(model: &str) -> Option<String> {
+    let key = key_for(model).ok()?;
+    let (size, mtime) = file_meta(&key).ok()?;
+    let fresh = |e_size: u64, e_mtime: i64| e_size == size && e_mtime == mtime;
+    if let Some(e) = config::links().get(&key) {
+        if fresh(e.size, e.mtime) {
+            return Some(e.sha256.clone());
+        }
+    }
+    if let Some(e) = config::cached_hash(&key) {
+        if fresh(e.size, e.mtime) {
+            return Some(e.sha256);
+        }
+    }
+    eprintln!("  hashing {} for provenance (once per file)…", short(model));
+    let sha256 = match file_sha256_progress(Path::new(&key), size) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("⚠ could not hash ({e}) — submitting without ggufSha256");
+            return None;
+        }
+    };
+    let _ = config::store_hash(
+        &key,
+        HashEntry {
+            sha256: sha256.clone(),
+            size,
+            mtime,
+        },
+    );
+    Some(sha256)
 }
 
 /// Resolve the stored link for a model path at run time. Size+mtime unchanged ⇒

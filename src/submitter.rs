@@ -345,6 +345,10 @@ pub fn build_submission(
             base_model,
             hf_model,
             hf_verified,
+            // Recorded for every local file (ADR-010): the server attaches web-side
+            // provenance by this hash. None when the path isn't a readable file
+            // (e.g. the server drop-in's -hf label).
+            gguf_sha256: link::sha256_for(ctx.model_path),
         },
         metrics: Metrics {
             decode_tps: b.decode_tps,

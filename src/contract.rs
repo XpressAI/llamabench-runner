@@ -37,6 +37,11 @@ pub struct ModelInfo {
     /// true on the download path, or the result of a SHA-256 match for a local file.
     #[serde(rename = "hfVerified", skip_serializing_if = "Option::is_none")]
     pub hf_verified: Option<bool>,
+    /// SHA-256 of the benchmarked GGUF (lowercase hex). The server uses it to attach
+    /// web-side Hugging Face provenance: one verified link on llamabench.ai
+    /// attributes every submission of the same file (ADR-010).
+    #[serde(rename = "ggufSha256", skip_serializing_if = "Option::is_none")]
+    pub gguf_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,11 +145,13 @@ mod tests {
             base_model: Some("google/gemma-4-12b-it".to_string()),
             hf_model: Some("unsloth/gemma-4-12b-it-GGUF".to_string()),
             hf_verified: Some(true),
+            gguf_sha256: Some("ab".repeat(32)),
         };
         let j = serde_json::to_value(&m).unwrap();
         assert_eq!(j["baseModel"], "google/gemma-4-12b-it");
         assert_eq!(j["hfModel"], "unsloth/gemma-4-12b-it-GGUF");
         assert_eq!(j["hfVerified"], true);
+        assert_eq!(j["ggufSha256"], "ab".repeat(32));
     }
 
     #[test]
@@ -156,11 +163,13 @@ mod tests {
             base_model: None,
             hf_model: None,
             hf_verified: None,
+            gguf_sha256: None,
         };
         let obj = serde_json::to_value(&m).unwrap();
         let obj = obj.as_object().unwrap();
         assert!(!obj.contains_key("baseModel"));
         assert!(!obj.contains_key("hfModel"));
         assert!(!obj.contains_key("hfVerified"));
+        assert!(!obj.contains_key("ggufSha256"));
     }
 }
