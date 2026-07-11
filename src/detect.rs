@@ -15,6 +15,7 @@ pub fn vendor_of(name: &str) -> &'static str {
         || n.contains(" m2")
         || n.contains(" m3")
         || n.contains(" m4")
+        || n.contains(" m5")
     {
         "Apple"
     } else if n.contains("intel") {
@@ -75,6 +76,40 @@ pub fn gpu_name() -> Option<String> {
     nvidia_gpu_name().or_else(apple_chip)
 }
 
+/// The host CPU model as the OS reports it, e.g. "AMD EPYC 7J13 64-Core Processor".
+/// Best-effort: /proc/cpuinfo on Linux, sysctl on macOS, PROCESSOR_IDENTIFIER on
+/// Windows. None when nothing usable is found — the submission field is optional.
+pub fn cpu_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        info.lines()
+            .find_map(|line| line.strip_prefix("model name"))
+            .map(|v| clean_spaces(v.trim_start_matches([' ', '\t', ':'])))
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        sysctl("machdep.cpu.brand_string").map(|s| clean_spaces(&s))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("PROCESSOR_IDENTIFIER")
+            .ok()
+            .map(|s| clean_spaces(&s))
+            .filter(|s| !s.is_empty())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Collapse runs of whitespace — Intel brand strings pad with doubled spaces.
+fn clean_spaces(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Apple unified memory (≈ usable GPU memory) in GB, via sysctl. 0 off macOS / on failure.
 pub fn apple_unified_mem_gb() -> f64 {
     #[cfg(target_os = "macos")]
@@ -111,8 +146,24 @@ mod tests {
         assert_eq!(vendor_of("AMD Radeon Pro 5500M (MoltenVK)"), "AMD");
         assert_eq!(vendor_of("NVIDIA GeForce RTX 4090"), "NVIDIA");
         assert_eq!(vendor_of("Apple M4 Max"), "Apple");
+        assert_eq!(vendor_of("Apple M5 Pro"), "Apple");
         assert_eq!(vendor_of("Intel(R) UHD Graphics 630"), "Intel");
         assert_eq!(vendor_of("Ryzen 9 7950X"), "CPU");
+    }
+
+    #[test]
+    fn cpu_brand_strings_collapse_padding() {
+        assert_eq!(
+            clean_spaces("Intel(R) Xeon(R) CPU  E5-2680 v4  @  2.40GHz"),
+            "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cpu_name_detects_something_on_dev_and_ci_hosts() {
+        let name = cpu_name().expect("linux/macos should always yield a CPU model");
+        assert!(!name.trim().is_empty());
     }
 
     #[test]

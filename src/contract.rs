@@ -16,6 +16,10 @@ pub struct Hardware {
     pub vram_gb: f64,
     #[serde(rename = "bandwidthGbs")]
     pub bandwidth_gbs: f64,
+    /// Host CPU model as reported by the OS — context for GPU results, the star
+    /// of CPU results. Optional in the contract; omitted when detection fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

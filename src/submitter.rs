@@ -337,6 +337,7 @@ pub fn build_submission(
             vendor: vendor.to_string(),
             vram_gb,
             bandwidth_gbs: 0.0,
+            cpu: detect::cpu_name(),
         },
         model: ModelInfo {
             id: model_id,
