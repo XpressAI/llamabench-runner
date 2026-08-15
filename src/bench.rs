@@ -84,6 +84,9 @@ pub fn run_llama_bench(opts: &BenchOpts) -> Result<BenchResult> {
     if parsed.type_v.is_empty() {
         parsed.type_v = opts.ctv.to_string();
     }
+    if parsed.devices.is_empty() && opts.ngl != 0 {
+        parsed.devices = list_devices(&bin);
+    }
 
     if parsed.prefill_tps == 0.0 && parsed.decode_tps == 0.0 {
         bail!(
@@ -207,11 +210,35 @@ fn parse_build(line: &str) -> Option<(String, String)> {
 /// Extract a device name from a backend init banner (printed to stderr). Handles the
 /// shapes llama.cpp uses across backends:
 ///   Vulkan/SYCL: "ggml_vulkan: 0 = AMD Radeon Pro 5500M (MoltenVK) | uma: 0 ..."
+///   Device list:  "Vulkan0: AMD Radeon RX 9060 XT (RADV GFX1200) (16304 MiB, ...)"
 ///   Metal:       "ggml_metal_init: picking default device: Apple M4" / "GPU name: Apple M4"
 ///   CUDA/HIP:    "  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes"
 /// Public: the drop-in modes scan the streams of the processes they spawn with it.
 pub fn parse_device(line: &str) -> Option<String> {
     let l = line.trim();
+
+    // `--list-devices` uses backend+index labels such as `Vulkan0:` / `CUDA0:`.
+    // Strip only the final memory tuple; driver qualifiers like `(RADV GFX1200)` are
+    // part of the useful device name and must remain available for canonical matching.
+    if let Some((label, listed_name)) = l.split_once(": ") {
+        if let Some(digit) = label.find(|c: char| c.is_ascii_digit()) {
+            let (backend, index) = label.split_at(digit);
+            let known_backend = ["Vulkan", "CUDA", "ROCm", "HIP", "Metal", "SYCL"]
+                .iter()
+                .any(|known| backend.eq_ignore_ascii_case(known));
+            if known_backend && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
+                let mut name = listed_name.trim();
+                if let Some((base, details)) = name.rsplit_once(" (") {
+                    if details.ends_with(')') && details.contains("MiB") {
+                        name = base.trim();
+                    }
+                }
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
 
     if l.starts_with("ggml_") {
         // Vulkan/SYCL: "ggml_vulkan: 0 = <name> | ...". REQUIRE a numeric device index right
@@ -255,6 +282,26 @@ pub fn parse_device(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Ask the selected llama.cpp binary for its devices when its normal startup banner
+/// didn't match a known shape. Unsupported/failed `--list-devices` calls simply preserve
+/// the existing OS fallback behavior.
+pub fn list_devices(bin: &Path) -> Vec<String> {
+    let Ok(output) = Command::new(bin).arg("--list-devices").output() else {
+        return Vec::new();
+    };
+    let mut devices = Vec::new();
+    for text in [&output.stdout, &output.stderr] {
+        for line in String::from_utf8_lossy(text).lines() {
+            if let Some(device) = parse_device(line) {
+                if !devices.contains(&device) {
+                    devices.push(device);
+                }
+            }
+        }
+    }
+    devices
 }
 
 #[cfg(test)]
@@ -351,6 +398,25 @@ ggml_cuda_init: found 1 CUDA devices:
             Some("AMD Radeon Pro 5500M (MoltenVK)".to_string())
         );
         assert_eq!(parse_device("llama_model_loader: loaded meta data"), None);
+    }
+
+    #[test]
+    fn parses_list_devices_vulkan_output() {
+        // Real RX 9060 XT output from llama-server --list-devices. The runner used to
+        // miss this shape and fall through to CPU because AMD has no nvidia-smi fallback.
+        assert_eq!(
+            parse_device(
+                "  Vulkan0: AMD Radeon RX 9060 XT (RADV GFX1200) (16304 MiB, 14280 MiB free)"
+            ),
+            Some("AMD Radeon RX 9060 XT (RADV GFX1200)".to_string())
+        );
+        assert_eq!(parse_device("Available devices:"), None);
+        assert_eq!(
+            parse_device(
+                "WARNING: radv is not a conformant Vulkan implementation, testing use only."
+            ),
+            None
+        );
     }
 
     #[test]

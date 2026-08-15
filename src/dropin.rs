@@ -576,6 +576,23 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         });
     }
 
+    // Some llama.cpp builds omit or change the backend init banner. For accelerator
+    // configurations whose benchmark rows also lack gpu_info, ask the exact selected
+    // binary for its device list. CPU matrix entries remain untouched.
+    if groups
+        .iter()
+        .any(|g| g.ngl != 0 && g.bench.devices.is_empty())
+    {
+        let listed = bench::list_devices(&Path::new(&dir).join("llama-bench"));
+        if !listed.is_empty() {
+            for g in &mut groups {
+                if g.ngl != 0 && g.bench.devices.is_empty() {
+                    g.bench.devices.clone_from(&listed);
+                }
+            }
+        }
+    }
+
     let command = redacted_command("llama-bench", args);
     let total = groups.len();
     for (i, g) in groups.iter().enumerate() {
@@ -853,6 +870,10 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok());
     let gpu_run = ngl.map_or_else(|| !devices.lock().unwrap().is_empty(), |n| n != 0);
 
+    let mut detected_devices = devices.lock().unwrap().clone();
+    if gpu_run && detected_devices.is_empty() {
+        detected_devices = bench::list_devices(&bin);
+    }
     let bench = BenchResult {
         model_label: model_label.clone(),
         params_b: submitter::params_from_name(&model_label),
@@ -864,7 +885,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         decode_tps: speed.decode,
         build_number,
         git_hash,
-        devices: devices.lock().unwrap().clone(),
+        devices: detected_devices,
     };
     let model_path_or_label = model_path.as_deref().unwrap_or(&model_label);
     let ctx = BuildCtx {
