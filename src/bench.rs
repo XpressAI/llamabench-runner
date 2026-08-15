@@ -85,7 +85,7 @@ pub fn run_llama_bench(opts: &BenchOpts) -> Result<BenchResult> {
         parsed.type_v = opts.ctv.to_string();
     }
     if parsed.devices.is_empty() && opts.ngl != 0 {
-        parsed.devices = list_devices(&bin);
+        parsed.devices = device_names_for_selection(&list_devices(&bin), None);
     }
 
     if parsed.prefill_tps == 0.0 && parsed.decode_tps == 0.0 {
@@ -217,27 +217,8 @@ fn parse_build(line: &str) -> Option<(String, String)> {
 pub fn parse_device(line: &str) -> Option<String> {
     let l = line.trim();
 
-    // `--list-devices` uses backend+index labels such as `Vulkan0:` / `CUDA0:`.
-    // Strip only the final memory tuple; driver qualifiers like `(RADV GFX1200)` are
-    // part of the useful device name and must remain available for canonical matching.
-    if let Some((label, listed_name)) = l.split_once(": ") {
-        if let Some(digit) = label.find(|c: char| c.is_ascii_digit()) {
-            let (backend, index) = label.split_at(digit);
-            let known_backend = ["Vulkan", "CUDA", "ROCm", "HIP", "Metal", "SYCL"]
-                .iter()
-                .any(|known| backend.eq_ignore_ascii_case(known));
-            if known_backend && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
-                let mut name = listed_name.trim();
-                if let Some((base, details)) = name.rsplit_once(" (") {
-                    if details.ends_with(')') && details.contains("MiB") {
-                        name = base.trim();
-                    }
-                }
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
+    if let Some(listed) = parse_listed_device(l) {
+        return Some(listed.name);
     }
 
     if l.starts_with("ggml_") {
@@ -284,24 +265,106 @@ pub fn parse_device(line: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedDevice {
+    selector: Option<String>,
+    name: String,
+}
+
+/// Parse the labelled shape emitted by `--list-devices`, retaining the selector
+/// (`Vulkan0`, `CUDA1`, ...) so a passthrough `--device` choice can be honored.
+fn parse_listed_device(line: &str) -> Option<ListedDevice> {
+    let (label, listed_name) = line.trim().split_once(": ")?;
+    let digit = label.find(|c: char| c.is_ascii_digit())?;
+    let (backend, index) = label.split_at(digit);
+    let known_backend = ["Vulkan", "CUDA", "ROCm", "HIP", "Metal", "SYCL"]
+        .iter()
+        .any(|known| backend.eq_ignore_ascii_case(known));
+    if !known_backend || index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    // Strip only the final memory tuple; driver qualifiers like `(RADV GFX1200)` are
+    // part of the useful device name and must remain available for canonical matching.
+    let mut name = listed_name.trim();
+    if let Some((base, details)) = name.rsplit_once(" (") {
+        if details.ends_with(')') && details.contains("MiB") {
+            name = base.trim();
+        }
+    }
+    (!name.is_empty()).then(|| ListedDevice {
+        selector: Some(label.to_string()),
+        name: name.to_string(),
+    })
+}
+
 /// Ask the selected llama.cpp binary for its devices when its normal startup banner
 /// didn't match a known shape. Unsupported/failed `--list-devices` calls simply preserve
 /// the existing OS fallback behavior.
-pub fn list_devices(bin: &Path) -> Vec<String> {
+pub fn list_devices(bin: &Path) -> Vec<ListedDevice> {
     let Ok(output) = Command::new(bin).arg("--list-devices").output() else {
         return Vec::new();
     };
-    let mut devices = Vec::new();
+    let mut listed = Vec::new();
+    let mut unlabelled = Vec::new();
     for text in [&output.stdout, &output.stderr] {
         for line in String::from_utf8_lossy(text).lines() {
-            if let Some(device) = parse_device(line) {
-                if !devices.contains(&device) {
-                    devices.push(device);
+            if let Some(device) = parse_listed_device(line) {
+                if !listed.contains(&device) {
+                    listed.push(device);
+                }
+            } else if let Some(name) = parse_device(line) {
+                let device = ListedDevice {
+                    selector: None,
+                    name,
+                };
+                if !unlabelled.contains(&device) {
+                    unlabelled.push(device);
                 }
             }
         }
     }
-    devices
+    if listed.is_empty() {
+        unlabelled
+    } else {
+        listed
+    }
+}
+
+/// Return device names in the user's requested order. With no explicit selection,
+/// preserve enumeration order; with `--device`, never substitute an unselected GPU.
+pub fn device_names_for_selection(devices: &[ListedDevice], selected: Option<&str>) -> Vec<String> {
+    let requested: Vec<&str> = selected
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    let mut names = Vec::new();
+    if requested.is_empty() {
+        for device in devices {
+            if !names.contains(&device.name) {
+                names.push(device.name.clone());
+            }
+        }
+        return names;
+    }
+
+    for wanted in requested {
+        if let Some(device) = devices.iter().find(|device| {
+            device
+                .selector
+                .as_deref()
+                .is_some_and(|selector| selector.eq_ignore_ascii_case(wanted))
+                || device.name.eq_ignore_ascii_case(wanted)
+        }) {
+            if !names.contains(&device.name) {
+                names.push(device.name.clone());
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -404,11 +467,17 @@ ggml_cuda_init: found 1 CUDA devices:
     fn parses_list_devices_vulkan_output() {
         // Real RX 9060 XT output from llama-server --list-devices. The runner used to
         // miss this shape and fall through to CPU because AMD has no nvidia-smi fallback.
+        let line = "  Vulkan0: AMD Radeon RX 9060 XT (RADV GFX1200) (16304 MiB, 14280 MiB free)";
         assert_eq!(
-            parse_device(
-                "  Vulkan0: AMD Radeon RX 9060 XT (RADV GFX1200) (16304 MiB, 14280 MiB free)"
-            ),
+            parse_device(line),
             Some("AMD Radeon RX 9060 XT (RADV GFX1200)".to_string())
+        );
+        assert_eq!(
+            parse_listed_device(line),
+            Some(ListedDevice {
+                selector: Some("Vulkan0".to_string()),
+                name: "AMD Radeon RX 9060 XT (RADV GFX1200)".to_string(),
+            })
         );
         assert_eq!(parse_device("Available devices:"), None);
         assert_eq!(
@@ -417,6 +486,28 @@ ggml_cuda_init: found 1 CUDA devices:
             ),
             None
         );
+    }
+
+    #[test]
+    fn selects_requested_device_by_backend_index() {
+        let devices = [
+            parse_listed_device("Vulkan0: AMD Radeon RX 7900 XTX (24560 MiB, 24000 MiB free)")
+                .unwrap(),
+            parse_listed_device("Vulkan1: AMD Radeon RX 9060 XT (16304 MiB, 14280 MiB free)")
+                .unwrap(),
+        ];
+        assert_eq!(
+            device_names_for_selection(&devices, Some("Vulkan1")),
+            vec!["AMD Radeon RX 9060 XT".to_string()]
+        );
+        assert_eq!(
+            device_names_for_selection(&devices, Some("Vulkan1,Vulkan0")),
+            vec![
+                "AMD Radeon RX 9060 XT".to_string(),
+                "AMD Radeon RX 7900 XTX".to_string()
+            ]
+        );
+        assert!(device_names_for_selection(&devices, Some("none")).is_empty());
     }
 
     #[test]

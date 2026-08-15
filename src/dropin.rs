@@ -194,6 +194,10 @@ fn flag_value(args: &[String], names: &[&str]) -> Option<String> {
     found
 }
 
+fn selected_device(args: &[String]) -> Option<String> {
+    flag_value(args, &["-dev", "--device"]).filter(|value| !value.is_empty())
+}
+
 /// Shell-quote a token if needed (for the recorded reproduce command).
 fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
@@ -583,7 +587,10 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         .iter()
         .any(|g| g.ngl != 0 && g.bench.devices.is_empty())
     {
-        let listed = bench::list_devices(&Path::new(&dir).join("llama-bench"));
+        let listed = bench::device_names_for_selection(
+            &bench::list_devices(&Path::new(&dir).join("llama-bench")),
+            selected_device(args).as_deref(),
+        );
         if !listed.is_empty() {
             for g in &mut groups {
                 if g.ngl != 0 && g.bench.devices.is_empty() {
@@ -872,7 +879,10 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
 
     let mut detected_devices = devices.lock().unwrap().clone();
     if gpu_run && detected_devices.is_empty() {
-        detected_devices = bench::list_devices(&bin);
+        detected_devices = bench::device_names_for_selection(
+            &bench::list_devices(&bin),
+            selected_device(args).as_deref(),
+        );
     }
     let bench = BenchResult {
         model_label: model_label.clone(),
@@ -978,6 +988,10 @@ mod tests {
         // Bare trailing flag → empty value, not None.
         assert_eq!(flag_value(&args, &["-fa"]).as_deref(), Some(""));
         assert_eq!(flag_value(&args, &["--port"]), None);
+        assert_eq!(
+            selected_device(&v(&["--device=Vulkan0", "-dev", "Vulkan1,Vulkan0"])),
+            Some("Vulkan1,Vulkan0".to_string())
+        );
     }
 
     #[test]
