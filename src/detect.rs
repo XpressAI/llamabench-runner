@@ -65,6 +65,34 @@ fn parse_nvidia_smi(output: &str) -> Vec<NvidiaGpu> {
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NvidiaMig {
+    uuid: String,
+    memory_gb: u64,
+}
+
+fn parse_nvidia_mig_list(output: &str) -> Vec<NvidiaMig> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let details = line.strip_prefix("MIG ")?;
+            let profile = details.split_whitespace().next()?;
+            let memory_gb = profile.split('.').find_map(|part| {
+                let lower = part.to_ascii_lowercase();
+                let (value, _) = lower.split_once("gb")?;
+                value.parse::<u64>().ok()
+            })?;
+            let (_, uuid) = line.rsplit_once("(UUID: ")?;
+            let uuid = uuid.strip_suffix(')')?.trim();
+            Some(NvidiaMig {
+                uuid: uuid.to_string(),
+                memory_gb,
+            })
+        })
+        .collect()
+}
+
 fn selector_index(selector: &str) -> Option<usize> {
     let digits = selector
         .trim()
@@ -78,22 +106,32 @@ fn selector_index(selector: &str) -> Option<usize> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
-fn identity_matches(gpu: &NvidiaGpu, identity: &str) -> bool {
-    gpu.uuid.eq_ignore_ascii_case(identity)
-        || gpu
-            .uuid
-            .to_lowercase()
-            .starts_with(&identity.to_lowercase())
+fn uuid_matches(uuid: &str, identity: &str) -> bool {
+    uuid.eq_ignore_ascii_case(identity) || uuid.to_lowercase().starts_with(&identity.to_lowercase())
+}
+
+fn unique_by_identity<'a, T>(
+    values: &'a [T],
+    identity: &str,
+    uuid: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    let mut matches = values
+        .iter()
+        .filter(|value| uuid_matches(uuid(value), identity));
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
 }
 
 fn nvidia_smi_vram_gb(
     output: &str,
+    mig_output: &str,
     device_name: &str,
     selected_device: Option<&str>,
     cuda_visible_devices: Option<&str>,
     cuda_backend: bool,
 ) -> Option<u64> {
     let gpus = parse_nvidia_smi(output);
+    let mig_devices = parse_nvidia_mig_list(mig_output);
     let selected = selected_device
         .and_then(|value| value.split(',').next())
         .map(str::trim)
@@ -108,30 +146,43 @@ fn nvidia_smi_vram_gb(
             }
         });
 
-    let selected_gpu = selected
-        .and_then(|selector| {
-            if selector.starts_with("GPU-") {
-                return gpus.iter().find(|gpu| identity_matches(gpu, selector));
-            }
-            if !selector.to_ascii_uppercase().starts_with("CUDA") {
-                return None;
-            }
-            let logical_index = selector_index(selector)?;
-            let identity = cuda_visible_devices
-                .and_then(|visible| visible.split(',').nth(logical_index))
-                .map(str::trim)
-                .filter(|identity| identity.starts_with("GPU-"))?;
-            gpus.iter().find(|gpu| identity_matches(gpu, identity))
-        })
-        .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+    let selected_identity = selected.and_then(|selector| {
+        let upper = selector.to_ascii_uppercase();
+        if upper.starts_with("GPU-") || upper.starts_with("MIG-") {
+            return Some(selector);
+        }
+        if !upper.starts_with("CUDA") {
+            return None;
+        }
+        let logical_index = selector_index(selector)?;
+        cuda_visible_devices
+            .and_then(|visible| visible.split(',').nth(logical_index))
+            .map(str::trim)
+            .filter(|identity| {
+                let upper = identity.to_ascii_uppercase();
+                upper.starts_with("GPU-") || upper.starts_with("MIG-")
+            })
+    });
 
-    let gpu = selected_gpu.or_else(|| {
-        let mut matches = gpus
-            .iter()
-            .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
-        let only = matches.next()?;
-        matches.next().is_none().then_some(only)
-    })?;
+    if let Some(identity) = selected_identity {
+        if identity.to_ascii_uppercase().starts_with("MIG-") {
+            return unique_by_identity(&mig_devices, identity, |mig| &mig.uuid)
+                .map(|mig| mig.memory_gb);
+        }
+        if let Some(gpu) = unique_by_identity(&gpus, identity, |gpu| &gpu.uuid)
+            .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
+        {
+            return bytes_to_rounded_gib(gpu.memory_mib.saturating_mul(1024 * 1024));
+        }
+    }
+
+    let mut matches = gpus
+        .iter()
+        .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+    let gpu = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
     bytes_to_rounded_gib(gpu.memory_mib.saturating_mul(1024 * 1024))
 }
 
@@ -157,8 +208,16 @@ pub fn nvidia_vram_gb(
     let cuda_backend = backend_label
         .split(|ch: char| ch == ',' || ch.is_whitespace())
         .any(|part| part.eq_ignore_ascii_case("CUDA"));
+    let mig_list = std::process::Command::new("nvidia-smi")
+        .arg("-L")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
     nvidia_smi_vram_gb(
         &String::from_utf8_lossy(&output.stdout),
+        &mig_list,
         device_name,
         selected_device,
         visible.as_deref(),
@@ -349,9 +408,12 @@ mod tests {
         let output = "GPU-aaaaaaaa, NVIDIA GeForce RTX 4060 Ti, 8188\n\
                       GPU-bbbbbbbb, NVIDIA GeForce RTX 4060 Ti, 16380\n\
                       GPU-cccccccc, NVIDIA GeForce RTX 4090, 24564\n";
+        let mig_output = "GPU 0: NVIDIA A100-SXM4-80GB (UUID: GPU-dddddddd)\n\
+                          MIG 1c.3g.40gb Device 0: (UUID: MIG-eeeeeeee)\n";
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("CUDA1"),
                 None,
@@ -362,6 +424,7 @@ mod tests {
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("CUDA0"),
                 Some("GPU-bbbbbbbb,GPU-aaaaaaaa,GPU-cccccccc"),
@@ -372,6 +435,7 @@ mod tests {
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 None,
                 Some("GPU-bbbbbbbb"),
@@ -383,6 +447,7 @@ mod tests {
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 None,
                 Some("GPU-cccccccc"),
@@ -392,12 +457,20 @@ mod tests {
         );
         // Numeric CUDA ordinals are not nvidia-smi indices; never cross-map them.
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"), true,),
+            nvidia_smi_vram_gb(
+                output,
+                mig_output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                None,
+                Some("1"),
+                true,
+            ),
             None
         );
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("GPU-aaaaaaaa"),
                 None,
@@ -406,13 +479,21 @@ mod tests {
             Some(8)
         );
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", None, None, false),
+            nvidia_smi_vram_gb(
+                output,
+                mig_output,
+                "NVIDIA GeForce RTX 4090",
+                None,
+                None,
+                false,
+            ),
             Some(24)
         );
         // A non-CUDA backend's ordinal is unrelated to nvidia-smi's index.
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4090",
                 Some("Vulkan1"),
                 None,
@@ -422,16 +503,47 @@ mod tests {
         );
         // Duplicate names are ambiguous without a selector; never guess the variant.
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, None, false,),
+            nvidia_smi_vram_gb(
+                output,
+                mig_output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                None,
+                None,
+                false,
+            ),
             None
         );
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
+                mig_output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("Vulkan1"),
                 None,
                 false,
+            ),
+            None
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                output,
+                mig_output,
+                "NVIDIA A100-SXM4-80GB MIG 3g.40gb",
+                None,
+                Some("MIG-eeeeeeee"),
+                true,
+            ),
+            Some(40)
+        );
+        // A missing MIG UUID must not fall back to the parent GPU's full memory.
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                "GPU-dddddddd, NVIDIA A100-SXM4-80GB, 81920\n",
+                mig_output,
+                "NVIDIA A100-SXM4-80GB",
+                None,
+                Some("MIG-missing"),
+                true,
             ),
             None
         );
