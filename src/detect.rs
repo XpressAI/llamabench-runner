@@ -91,6 +91,7 @@ fn nvidia_smi_vram_gb(
     device_name: &str,
     selected_device: Option<&str>,
     cuda_visible_devices: Option<&str>,
+    cuda_backend: bool,
 ) -> Option<u64> {
     let gpus = parse_nvidia_smi(output);
     let selected = selected_device
@@ -98,9 +99,13 @@ fn nvidia_smi_vram_gb(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| {
-            cuda_visible_devices
-                .filter(|visible| !visible.trim().is_empty())
-                .map(|_| "CUDA0")
+            if cuda_backend {
+                cuda_visible_devices
+                    .filter(|visible| !visible.trim().is_empty())
+                    .map(|_| "CUDA0")
+            } else {
+                None
+            }
         });
 
     let selected_gpu = selected
@@ -133,7 +138,11 @@ fn nvidia_smi_vram_gb(
 /// Installed VRAM for the selected NVIDIA device, rounded to whole GiB. This
 /// disambiguates cards such as the RTX 4060 Ti whose 8 GB and 16 GB variants
 /// report the same model name.
-pub fn nvidia_vram_gb(device_name: &str, selected_device: Option<&str>) -> Option<u64> {
+pub fn nvidia_vram_gb(
+    device_name: &str,
+    selected_device: Option<&str>,
+    backend_label: &str,
+) -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=uuid,name,memory.total",
@@ -145,11 +154,15 @@ pub fn nvidia_vram_gb(device_name: &str, selected_device: Option<&str>) -> Optio
         return None;
     }
     let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    let cuda_backend = backend_label
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .any(|part| part.eq_ignore_ascii_case("CUDA"));
     nvidia_smi_vram_gb(
         &String::from_utf8_lossy(&output.stdout),
         device_name,
         selected_device,
         visible.as_deref(),
+        cuda_backend,
     )
 }
 
@@ -337,7 +350,13 @@ mod tests {
                       GPU-bbbbbbbb, NVIDIA GeForce RTX 4060 Ti, 16380\n\
                       GPU-cccccccc, NVIDIA GeForce RTX 4090, 24564\n";
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", Some("CUDA1"), None),
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                Some("CUDA1"),
+                None,
+                true,
+            ),
             None
         );
         assert_eq!(
@@ -346,6 +365,7 @@ mod tests {
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("CUDA0"),
                 Some("GPU-bbbbbbbb,GPU-aaaaaaaa,GPU-cccccccc"),
+                true,
             ),
             Some(16)
         );
@@ -355,6 +375,7 @@ mod tests {
                 "NVIDIA GeForce RTX 4060 Ti",
                 None,
                 Some("GPU-bbbbbbbb"),
+                true,
             ),
             Some(16)
         );
@@ -365,12 +386,13 @@ mod tests {
                 "NVIDIA GeForce RTX 4060 Ti",
                 None,
                 Some("GPU-cccccccc"),
+                false,
             ),
             None
         );
         // Numeric CUDA ordinals are not nvidia-smi indices; never cross-map them.
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"),),
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"), true,),
             None
         );
         assert_eq!(
@@ -379,25 +401,38 @@ mod tests {
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("GPU-aaaaaaaa"),
                 None,
+                false,
             ),
             Some(8)
         );
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", None, None),
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", None, None, false),
             Some(24)
         );
         // A non-CUDA backend's ordinal is unrelated to nvidia-smi's index.
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", Some("Vulkan1"), None),
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4090",
+                Some("Vulkan1"),
+                None,
+                false,
+            ),
             Some(24)
         );
         // Duplicate names are ambiguous without a selector; never guess the variant.
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, None),
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, None, false,),
             None
         );
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", Some("Vulkan1"), None,),
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                Some("Vulkan1"),
+                None,
+                false,
+            ),
             None
         );
     }

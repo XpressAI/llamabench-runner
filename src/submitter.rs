@@ -331,7 +331,7 @@ pub fn build_submission(
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
     } else if vendor == "NVIDIA" {
-        detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref())
+        detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
             .map_or(0.0, |gib| gib as f64)
     } else {
         0.0
