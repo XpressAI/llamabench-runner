@@ -878,17 +878,27 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok());
     let gpu_run = ngl.map_or_else(|| !devices.lock().unwrap().is_empty(), |n| n != 0);
 
+    let requested_device = selected_device(args);
+    let listed_devices = if gpu_run {
+        bench::list_devices(&bin)
+    } else {
+        Vec::new()
+    };
     let mut detected_devices = devices.lock().unwrap().clone();
     if gpu_run && detected_devices.is_empty() {
-        detected_devices = bench::device_names_for_selection(
-            &bench::list_devices(&bin),
-            selected_device(args).as_deref(),
-        );
+        detected_devices =
+            bench::device_names_for_selection(&listed_devices, requested_device.as_deref());
     }
+    let backend_label = detected_devices
+        .first()
+        .and_then(|name| {
+            bench::backend_for_selection(&listed_devices, requested_device.as_deref(), name)
+        })
+        .unwrap_or_default();
     let bench = BenchResult {
         model_label: model_label.clone(),
         params_b: submitter::params_from_name(&model_label),
-        backend_label: String::new(),
+        backend_label,
         type_k,
         type_v,
         flash_attn,
@@ -901,7 +911,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     let model_path_or_label = model_path.as_deref().unwrap_or(&model_label);
     let ctx = BuildCtx {
         gpu_run,
-        selected_device: selected_device(args),
+        selected_device: requested_device,
         handle: &w.handle,
         family: w.family,
         command: redacted_command("llama-server", args),
