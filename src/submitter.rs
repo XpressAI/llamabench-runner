@@ -322,10 +322,13 @@ pub fn build_submission(
         }
     };
     let vendor = detect::vendor_of(&device);
-    // Apple is unified memory (≈ usable GPU memory); report it so the site shows real VRAM.
-    // For discrete GPUs the server fills VRAM/bandwidth from its catalog.
+    // Apple is unified memory (≈ usable GPU memory). NVIDIA VRAM is measured so
+    // same-name capacity variants such as the RTX 4060 Ti stay distinct. The server
+    // fills catalog memory for other discrete GPUs.
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
+    } else if vendor == "NVIDIA" {
+        detect::nvidia_vram_gb(&device).map_or(0.0, |gib| gib as f64)
     } else {
         0.0
     };

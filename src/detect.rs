@@ -44,6 +44,34 @@ pub fn nvidia_gpu_name() -> Option<String> {
         .map(str::to_string)
 }
 
+fn nvidia_smi_vram_gb(output: &str, device_name: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let (name, memory_mib) = line.rsplit_once(',')?;
+        if !name.trim().eq_ignore_ascii_case(device_name.trim()) {
+            return None;
+        }
+        let memory_mib = memory_mib.trim().parse::<u64>().ok()?;
+        bytes_to_rounded_gib(memory_mib.saturating_mul(1024 * 1024))
+    })
+}
+
+/// Installed VRAM for the selected NVIDIA device, rounded to whole GiB. This
+/// disambiguates cards such as the RTX 4060 Ti whose 8 GB and 16 GB variants
+/// report the same model name.
+pub fn nvidia_vram_gb(device_name: &str) -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    nvidia_smi_vram_gb(&String::from_utf8_lossy(&output.stdout), device_name)
+}
+
 #[cfg(target_os = "macos")]
 fn sysctl(key: &str) -> Option<String> {
     let out = std::process::Command::new("sysctl")
@@ -220,6 +248,20 @@ mod tests {
     fn rounds_physical_memory_to_whole_gibibytes() {
         assert_eq!(bytes_to_rounded_gib(16 * BYTES_PER_GIB), Some(16));
         assert_eq!(bytes_to_rounded_gib(0), None);
+    }
+
+    #[test]
+    fn parses_nvidia_memory_for_the_selected_device() {
+        let output = "NVIDIA GeForce RTX 4060 Ti, 8188\nNVIDIA GeForce RTX 4090, 24564\n";
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti"),
+            Some(8)
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090"),
+            Some(24)
+        );
+        assert_eq!(nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 3090"), None);
     }
 
     #[test]
