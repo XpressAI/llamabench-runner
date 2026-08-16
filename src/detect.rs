@@ -169,11 +169,9 @@ fn nvidia_smi_vram_gb(
             return unique_by_identity(&mig_devices, identity, |mig| &mig.uuid)
                 .map(|mig| mig.memory_gb);
         }
-        if let Some(gpu) = unique_by_identity(&gpus, identity, |gpu| &gpu.uuid)
+        return unique_by_identity(&gpus, identity, |gpu| &gpu.uuid)
             .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
-        {
-            return bytes_to_rounded_gib(gpu.memory_mib.saturating_mul(1024 * 1024));
-        }
+            .and_then(|gpu| bytes_to_rounded_gib(gpu.memory_mib.saturating_mul(1024 * 1024)));
     }
 
     let mut matches = gpus
@@ -477,6 +475,18 @@ mod tests {
                 false,
             ),
             Some(8)
+        );
+        // A stable UUID must never fall back to a different uniquely named GPU.
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                output,
+                mig_output,
+                "NVIDIA GeForce RTX 4090",
+                Some("GPU-aaaaaaaa"),
+                None,
+                false,
+            ),
+            None
         );
         assert_eq!(
             nvidia_smi_vram_gb(
