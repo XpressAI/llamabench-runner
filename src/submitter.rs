@@ -338,6 +338,7 @@ pub fn build_submission(
             vram_gb,
             bandwidth_gbs: 0.0,
             cpu: detect::cpu_name(),
+            system_ram_gb: detect::system_ram_gb(),
         },
         model: ModelInfo {
             id: model_id,

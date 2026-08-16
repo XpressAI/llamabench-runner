@@ -105,6 +105,63 @@ pub fn cpu_name() -> Option<String> {
     }
 }
 
+const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+fn bytes_to_rounded_gib(bytes: u64) -> Option<u64> {
+    (bytes > 0).then_some((bytes.saturating_add(BYTES_PER_GIB / 2) / BYTES_PER_GIB).max(1))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_meminfo_gib(info: &str) -> Option<u64> {
+    let kib = info.lines().find_map(|line| {
+        let value = line.strip_prefix("MemTotal:")?.trim();
+        let mut parts = value.split_whitespace();
+        let kib = parts.next()?.parse::<u64>().ok()?;
+        parts.next()?.eq_ignore_ascii_case("kb").then_some(kib)
+    })?;
+    bytes_to_rounded_gib(kib.saturating_mul(1024))
+}
+
+/// Total physical system memory in GiB, rounded to the nearest whole GiB.
+/// Best-effort: /proc/meminfo on Linux, hw.memsize on macOS, and CIM through
+/// PowerShell on Windows. None keeps the additive contract field absent.
+pub fn system_ram_gb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        linux_meminfo_gib(&info)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = sysctl("hw.memsize")?.parse::<u64>().ok()?;
+        bytes_to_rounded_gib(bytes)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let bytes = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        bytes_to_rounded_gib(bytes)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 /// Collapse runs of whitespace — Intel brand strings pad with doubled spaces.
 fn clean_spaces(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -160,10 +217,30 @@ mod tests {
     }
 
     #[test]
+    fn rounds_physical_memory_to_whole_gibibytes() {
+        assert_eq!(bytes_to_rounded_gib(16 * BYTES_PER_GIB), Some(16));
+        assert_eq!(bytes_to_rounded_gib(0), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parses_linux_memtotal() {
+        let info = "MemTotal:       131072000 kB\nMemFree:          123456 kB\n";
+        assert_eq!(linux_meminfo_gib(info), Some(125));
+        assert_eq!(linux_meminfo_gib("MemFree: 10 kB\n"), None);
+    }
+
+    #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn cpu_name_detects_something_on_dev_and_ci_hosts() {
         let name = cpu_name().expect("linux/macos should always yield a CPU model");
         assert!(!name.trim().is_empty());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn system_ram_detects_something_on_dev_and_ci_hosts() {
+        assert!(system_ram_gb().is_some_and(|gib| gib > 0));
     }
 
     #[test]
