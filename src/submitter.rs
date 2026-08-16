@@ -267,6 +267,9 @@ pub struct BuildCtx<'a> {
     /// Whether the run used an accelerator (`-ngl != 0` / a device banner appeared) —
     /// gates the Apple-chip device naming and the GPU-name fallback.
     pub gpu_run: bool,
+    /// Explicit llama.cpp device selector (`CUDA1`, UUID, etc.), when supplied. This
+    /// keeps per-device properties tied to the GPU that actually ran the benchmark.
+    pub selected_device: Option<String>,
     pub handle: &'a str,
     pub family: Family,
     /// The exact reproduce command recorded on the result (paths/keys already redacted).
@@ -322,10 +325,14 @@ pub fn build_submission(
         }
     };
     let vendor = detect::vendor_of(&device);
-    // Apple is unified memory (≈ usable GPU memory); report it so the site shows real VRAM.
-    // For discrete GPUs the server fills VRAM/bandwidth from its catalog.
+    // Apple is unified memory (≈ usable GPU memory). NVIDIA VRAM is measured so
+    // same-name capacity variants such as the RTX 4060 Ti stay distinct. The server
+    // fills catalog memory for other discrete GPUs.
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
+    } else if vendor == "NVIDIA" {
+        detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
+            .map_or(0.0, |gib| gib as f64)
     } else {
         0.0
     };
@@ -338,6 +345,7 @@ pub fn build_submission(
             vram_gb,
             bandwidth_gbs: 0.0,
             cpu: detect::cpu_name(),
+            system_ram_gb: detect::system_ram_gb(),
         },
         model: ModelInfo {
             id: model_id,

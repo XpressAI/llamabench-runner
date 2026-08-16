@@ -20,6 +20,10 @@ pub struct Hardware {
     /// of CPU results. Optional in the contract; omitted when detection fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
+    /// Total host memory in GiB. Per-submission context for models that only
+    /// partially fit in accelerator memory; omitted when detection fails.
+    #[serde(rename = "systemRamGb", skip_serializing_if = "Option::is_none")]
+    pub system_ram_gb: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,6 +143,21 @@ pub struct Submitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_serializes_optional_system_ram() {
+        let hardware = Hardware {
+            id: "rtx4060".to_string(),
+            name: "NVIDIA GeForce RTX 4060".to_string(),
+            vendor: "NVIDIA".to_string(),
+            vram_gb: 0.0,
+            bandwidth_gbs: 0.0,
+            cpu: Some("AMD Ryzen 9 7950X".to_string()),
+            system_ram_gb: Some(128),
+        };
+        let json = serde_json::to_value(&hardware).unwrap();
+        assert_eq!(json["systemRamGb"], 128);
+    }
 
     #[test]
     fn model_info_serializes_hf_fields() {

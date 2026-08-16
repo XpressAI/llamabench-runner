@@ -367,6 +367,46 @@ pub fn device_names_for_selection(devices: &[ListedDevice], selected: Option<&st
     names
 }
 
+/// Backend for the selected/detected device when `--list-devices` identifies it
+/// unambiguously. This lets server submissions retain CUDA vs Vulkan without
+/// assuming that the installed NVIDIA driver implies the backend used.
+pub fn backend_for_selection(
+    devices: &[ListedDevice],
+    selected: Option<&str>,
+    device_name: &str,
+) -> Option<String> {
+    let requested = selected
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut backends = Vec::new();
+    for device in devices.iter().filter(|device| {
+        device.name.eq_ignore_ascii_case(device_name)
+            && requested.is_none_or(|wanted| {
+                device
+                    .selector
+                    .as_deref()
+                    .is_some_and(|selector| selector.eq_ignore_ascii_case(wanted))
+                    || device.name.eq_ignore_ascii_case(wanted)
+            })
+    }) {
+        let Some(selector) = device.selector.as_deref() else {
+            continue;
+        };
+        let Some(digit) = selector.find(|ch: char| ch.is_ascii_digit()) else {
+            continue;
+        };
+        let backend = selector[..digit].to_string();
+        if !backends
+            .iter()
+            .any(|known: &String| known.eq_ignore_ascii_case(&backend))
+        {
+            backends.push(backend);
+        }
+    }
+    (backends.len() == 1).then(|| backends.remove(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +548,25 @@ ggml_cuda_init: found 1 CUDA devices:
             ]
         );
         assert!(device_names_for_selection(&devices, Some("none")).is_empty());
+        assert_eq!(
+            backend_for_selection(&devices, Some("Vulkan1"), "AMD Radeon RX 9060 XT"),
+            Some("Vulkan".to_string())
+        );
+
+        let ambiguous = [
+            parse_listed_device("CUDA0: NVIDIA GeForce RTX 4090 (24564 MiB, 24000 MiB free)")
+                .unwrap(),
+            parse_listed_device("Vulkan0: NVIDIA GeForce RTX 4090 (24564 MiB, 24000 MiB free)")
+                .unwrap(),
+        ];
+        assert_eq!(
+            backend_for_selection(&ambiguous, None, "NVIDIA GeForce RTX 4090"),
+            None
+        );
+        assert_eq!(
+            backend_for_selection(&ambiguous, Some("CUDA0"), "NVIDIA GeForce RTX 4090",),
+            Some("CUDA".to_string())
+        );
     }
 
     #[test]
