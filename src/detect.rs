@@ -46,7 +46,6 @@ pub fn nvidia_gpu_name() -> Option<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct NvidiaGpu {
-    index: usize,
     uuid: String,
     name: String,
     memory_mib: u64,
@@ -56,9 +55,8 @@ fn parse_nvidia_smi(output: &str) -> Vec<NvidiaGpu> {
     output
         .lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(4, ',').map(str::trim);
+            let mut fields = line.splitn(3, ',').map(str::trim);
             Some(NvidiaGpu {
-                index: fields.next()?.parse().ok()?,
                 uuid: fields.next()?.to_string(),
                 name: fields.next()?.to_string(),
                 memory_mib: fields.next()?.parse().ok()?,
@@ -81,10 +79,7 @@ fn selector_index(selector: &str) -> Option<usize> {
 }
 
 fn identity_matches(gpu: &NvidiaGpu, identity: &str) -> bool {
-    identity
-        .parse::<usize>()
-        .is_ok_and(|index| gpu.index == index)
-        || gpu.uuid.eq_ignore_ascii_case(identity)
+    gpu.uuid.eq_ignore_ascii_case(identity)
         || gpu
             .uuid
             .to_lowercase()
@@ -116,14 +111,11 @@ fn nvidia_smi_vram_gb(
             return None;
         }
         let logical_index = selector_index(selector)?;
-        if let Some(identity) = cuda_visible_devices
+        let identity = cuda_visible_devices
             .and_then(|visible| visible.split(',').nth(logical_index))
             .map(str::trim)
-            .filter(|identity| !identity.is_empty())
-        {
-            return gpus.iter().find(|gpu| identity_matches(gpu, identity));
-        }
-        gpus.iter().find(|gpu| gpu.index == logical_index)
+            .filter(|identity| identity.starts_with("GPU-"))?;
+        gpus.iter().find(|gpu| identity_matches(gpu, identity))
     });
 
     let gpu = selected_gpu.or_else(|| {
@@ -142,7 +134,7 @@ fn nvidia_smi_vram_gb(
 pub fn nvidia_vram_gb(device_name: &str, selected_device: Option<&str>) -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=index,uuid,name,memory.total",
+            "--query-gpu=uuid,name,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -339,25 +331,35 @@ mod tests {
 
     #[test]
     fn parses_nvidia_memory_for_the_selected_device() {
-        let output = "0, GPU-aaaaaaaa, NVIDIA GeForce RTX 4060 Ti, 8188\n\
-                      1, GPU-bbbbbbbb, NVIDIA GeForce RTX 4060 Ti, 16380\n\
-                      2, GPU-cccccccc, NVIDIA GeForce RTX 4090, 24564\n";
+        let output = "GPU-aaaaaaaa, NVIDIA GeForce RTX 4060 Ti, 8188\n\
+                      GPU-bbbbbbbb, NVIDIA GeForce RTX 4060 Ti, 16380\n\
+                      GPU-cccccccc, NVIDIA GeForce RTX 4090, 24564\n";
         assert_eq!(
             nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", Some("CUDA1"), None),
-            Some(16)
+            None
         );
         assert_eq!(
             nvidia_smi_vram_gb(
                 output,
                 "NVIDIA GeForce RTX 4060 Ti",
                 Some("CUDA0"),
-                Some("1,0,2"),
+                Some("GPU-bbbbbbbb,GPU-aaaaaaaa,GPU-cccccccc"),
             ),
             Some(16)
         );
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"),),
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                None,
+                Some("GPU-bbbbbbbb"),
+            ),
             Some(16)
+        );
+        // Numeric CUDA ordinals are not nvidia-smi indices; never cross-map them.
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"),),
+            None
         );
         assert_eq!(
             nvidia_smi_vram_gb(
