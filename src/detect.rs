@@ -101,7 +101,12 @@ fn nvidia_smi_vram_gb(
     let selected = selected_device
         .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cuda_visible_devices
+                .filter(|visible| !visible.trim().is_empty())
+                .map(|_| "CUDA0")
+        });
 
     let selected_gpu = selected.and_then(|selector| {
         if selector.starts_with("GPU-") {
@@ -347,6 +352,10 @@ mod tests {
                 Some("CUDA0"),
                 Some("1,0,2"),
             ),
+            Some(16)
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, Some("1"),),
             Some(16)
         );
         assert_eq!(
