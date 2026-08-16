@@ -44,24 +44,99 @@ pub fn nvidia_gpu_name() -> Option<String> {
         .map(str::to_string)
 }
 
-fn nvidia_smi_vram_gb(output: &str, device_name: &str) -> Option<u64> {
-    output.lines().find_map(|line| {
-        let (name, memory_mib) = line.rsplit_once(',')?;
-        if !name.trim().eq_ignore_ascii_case(device_name.trim()) {
-            return None;
+#[derive(Debug, PartialEq, Eq)]
+struct NvidiaGpu {
+    index: usize,
+    uuid: String,
+    name: String,
+    memory_mib: u64,
+}
+
+fn parse_nvidia_smi(output: &str) -> Vec<NvidiaGpu> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, ',').map(str::trim);
+            Some(NvidiaGpu {
+                index: fields.next()?.parse().ok()?,
+                uuid: fields.next()?.to_string(),
+                name: fields.next()?.to_string(),
+                memory_mib: fields.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn selector_index(selector: &str) -> Option<usize> {
+    let digits = selector
+        .trim()
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn identity_matches(gpu: &NvidiaGpu, identity: &str) -> bool {
+    identity
+        .parse::<usize>()
+        .is_ok_and(|index| gpu.index == index)
+        || gpu.uuid.eq_ignore_ascii_case(identity)
+        || gpu
+            .uuid
+            .to_lowercase()
+            .starts_with(&identity.to_lowercase())
+}
+
+fn nvidia_smi_vram_gb(
+    output: &str,
+    device_name: &str,
+    selected_device: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+) -> Option<u64> {
+    let gpus = parse_nvidia_smi(output);
+    let selected = selected_device
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let selected_gpu = selected.and_then(|selector| {
+        if selector.starts_with("GPU-") {
+            return gpus.iter().find(|gpu| identity_matches(gpu, selector));
         }
-        let memory_mib = memory_mib.trim().parse::<u64>().ok()?;
-        bytes_to_rounded_gib(memory_mib.saturating_mul(1024 * 1024))
-    })
+        let logical_index = selector_index(selector)?;
+        if selector.to_ascii_uppercase().starts_with("CUDA") {
+            if let Some(identity) = cuda_visible_devices
+                .and_then(|visible| visible.split(',').nth(logical_index))
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+            {
+                return gpus.iter().find(|gpu| identity_matches(gpu, identity));
+            }
+        }
+        gpus.iter().find(|gpu| gpu.index == logical_index)
+    });
+
+    let gpu = selected_gpu.or_else(|| {
+        let mut matches = gpus
+            .iter()
+            .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    })?;
+    bytes_to_rounded_gib(gpu.memory_mib.saturating_mul(1024 * 1024))
 }
 
 /// Installed VRAM for the selected NVIDIA device, rounded to whole GiB. This
 /// disambiguates cards such as the RTX 4060 Ti whose 8 GB and 16 GB variants
 /// report the same model name.
-pub fn nvidia_vram_gb(device_name: &str) -> Option<u64> {
+pub fn nvidia_vram_gb(device_name: &str, selected_device: Option<&str>) -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total",
+            "--query-gpu=index,uuid,name,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -69,7 +144,13 @@ pub fn nvidia_vram_gb(device_name: &str) -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    nvidia_smi_vram_gb(&String::from_utf8_lossy(&output.stdout), device_name)
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    nvidia_smi_vram_gb(
+        &String::from_utf8_lossy(&output.stdout),
+        device_name,
+        selected_device,
+        visible.as_deref(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -252,16 +333,40 @@ mod tests {
 
     #[test]
     fn parses_nvidia_memory_for_the_selected_device() {
-        let output = "NVIDIA GeForce RTX 4060 Ti, 8188\nNVIDIA GeForce RTX 4090, 24564\n";
+        let output = "0, GPU-aaaaaaaa, NVIDIA GeForce RTX 4060 Ti, 8188\n\
+                      1, GPU-bbbbbbbb, NVIDIA GeForce RTX 4060 Ti, 16380\n\
+                      2, GPU-cccccccc, NVIDIA GeForce RTX 4090, 24564\n";
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti"),
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", Some("CUDA1"), None),
+            Some(16)
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                Some("CUDA0"),
+                Some("1,0,2"),
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                Some("GPU-aaaaaaaa"),
+                None,
+            ),
             Some(8)
         );
         assert_eq!(
-            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090"),
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", None, None),
             Some(24)
         );
-        assert_eq!(nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 3090"), None);
+        // Duplicate names are ambiguous without a selector; never guess the variant.
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, None),
+            None
+        );
     }
 
     #[test]

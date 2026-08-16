@@ -650,6 +650,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         let hf = submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant);
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
+            selected_device: selected_device(args),
             handle: &w.handle,
             family: w.family,
             command: command.clone(),
@@ -900,6 +901,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     let model_path_or_label = model_path.as_deref().unwrap_or(&model_label);
     let ctx = BuildCtx {
         gpu_run,
+        selected_device: selected_device(args),
         handle: &w.handle,
         family: w.family,
         command: redacted_command("llama-server", args),
