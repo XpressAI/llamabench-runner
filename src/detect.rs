@@ -112,15 +112,16 @@ fn nvidia_smi_vram_gb(
         if selector.starts_with("GPU-") {
             return gpus.iter().find(|gpu| identity_matches(gpu, selector));
         }
+        if !selector.to_ascii_uppercase().starts_with("CUDA") {
+            return None;
+        }
         let logical_index = selector_index(selector)?;
-        if selector.to_ascii_uppercase().starts_with("CUDA") {
-            if let Some(identity) = cuda_visible_devices
-                .and_then(|visible| visible.split(',').nth(logical_index))
-                .map(str::trim)
-                .filter(|identity| !identity.is_empty())
-            {
-                return gpus.iter().find(|gpu| identity_matches(gpu, identity));
-            }
+        if let Some(identity) = cuda_visible_devices
+            .and_then(|visible| visible.split(',').nth(logical_index))
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+        {
+            return gpus.iter().find(|gpu| identity_matches(gpu, identity));
         }
         gpus.iter().find(|gpu| gpu.index == logical_index)
     });
@@ -371,9 +372,18 @@ mod tests {
             nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", None, None),
             Some(24)
         );
+        // A non-CUDA backend's ordinal is unrelated to nvidia-smi's index.
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4090", Some("Vulkan1"), None),
+            Some(24)
+        );
         // Duplicate names are ambiguous without a selector; never guess the variant.
         assert_eq!(
             nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", None, None),
+            None
+        );
+        assert_eq!(
+            nvidia_smi_vram_gb(output, "NVIDIA GeForce RTX 4060 Ti", Some("Vulkan1"), None,),
             None
         );
     }
