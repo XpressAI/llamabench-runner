@@ -103,20 +103,22 @@ fn nvidia_smi_vram_gb(
                 .map(|_| "CUDA0")
         });
 
-    let selected_gpu = selected.and_then(|selector| {
-        if selector.starts_with("GPU-") {
-            return gpus.iter().find(|gpu| identity_matches(gpu, selector));
-        }
-        if !selector.to_ascii_uppercase().starts_with("CUDA") {
-            return None;
-        }
-        let logical_index = selector_index(selector)?;
-        let identity = cuda_visible_devices
-            .and_then(|visible| visible.split(',').nth(logical_index))
-            .map(str::trim)
-            .filter(|identity| identity.starts_with("GPU-"))?;
-        gpus.iter().find(|gpu| identity_matches(gpu, identity))
-    });
+    let selected_gpu = selected
+        .and_then(|selector| {
+            if selector.starts_with("GPU-") {
+                return gpus.iter().find(|gpu| identity_matches(gpu, selector));
+            }
+            if !selector.to_ascii_uppercase().starts_with("CUDA") {
+                return None;
+            }
+            let logical_index = selector_index(selector)?;
+            let identity = cuda_visible_devices
+                .and_then(|visible| visible.split(',').nth(logical_index))
+                .map(str::trim)
+                .filter(|identity| identity.starts_with("GPU-"))?;
+            gpus.iter().find(|gpu| identity_matches(gpu, identity))
+        })
+        .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
 
     let gpu = selected_gpu.or_else(|| {
         let mut matches = gpus
@@ -355,6 +357,16 @@ mod tests {
                 Some("GPU-bbbbbbbb"),
             ),
             Some(16)
+        );
+        // CUDA visibility may be inherited by a non-CUDA run; reject name mismatches.
+        assert_eq!(
+            nvidia_smi_vram_gb(
+                output,
+                "NVIDIA GeForce RTX 4060 Ti",
+                None,
+                Some("GPU-cccccccc"),
+            ),
+            None
         );
         // Numeric CUDA ordinals are not nvidia-smi indices; never cross-map them.
         assert_eq!(
