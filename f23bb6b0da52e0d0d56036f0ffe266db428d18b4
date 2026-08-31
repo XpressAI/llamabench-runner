@@ -1,0 +1,1 @@
+Thinking: The repair scenario is meant to measure inspection before mutation, so a lucky direct write is not a pass. Track that the model read the target before its successful write; the server separately reconstructs the same evidence from the transcript.
