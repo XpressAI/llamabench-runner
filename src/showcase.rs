@@ -624,6 +624,11 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
                     &lower,
                     &[
                         "do not possess",
+                        "possess no",
+                        "cannot",
+                        "can't",
+                        "do not have",
+                        "don't have",
                         "no such",
                         "unknown to me",
                         "unfamiliar",
@@ -835,6 +840,12 @@ mod tests {
             "I do not possess such a device. My railway timetable and the next steamship shall suffice.",
         );
         assert!(modern.iter().all(|c| c.passed));
+
+        let common_refusal = roleplay_checks(
+            "modern-navigation",
+            "I cannot use a smartphone; I would consult a railway timetable.",
+        );
+        assert!(common_refusal.iter().all(|c| c.passed));
 
         let broken = roleplay_checks(
             "period-worldview",
