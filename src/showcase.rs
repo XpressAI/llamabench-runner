@@ -43,6 +43,19 @@ const CONTROLLED_SERVER_FLAGS: &[&str] = &[
     "--api-key",
     "--api-key-file",
 ];
+const UNTRACKED_ARTIFACT_FLAGS: &[&str] = &[
+    "-md",
+    "--model-draft",
+    "--mmproj",
+    "--chat-template-file",
+    "--grammar-file",
+    "--lora",
+    "--lora-scaled",
+    "--control-vector",
+    "--control-vector-scaled",
+    "--lookup-cache-static",
+    "--lookup-cache-dynamic",
+];
 
 pub struct ShowcaseOpts<'a> {
     pub server_bin_dir: &'a str,
@@ -164,6 +177,11 @@ fn validate_extra_server_args(args: &[String]) -> Result<()> {
         if CONTROLLED_SERVER_FLAGS.contains(&flag) {
             bail!(
                 "{flag} is controlled by `llamabench showcase`; use the corresponding showcase option instead"
+            );
+        }
+        if UNTRACKED_ARTIFACT_FLAGS.contains(&flag) {
+            bail!(
+                "{flag} supplies an auxiliary artifact that is not represented in ability-showcase-v1 provenance"
             );
         }
     }
@@ -996,5 +1014,24 @@ mod tests {
             "draft-mtp".to_string(),
         ])
         .unwrap();
+    }
+
+    #[test]
+    fn extra_server_args_reject_untracked_behavior_artifacts() {
+        for flag in [
+            "-md",
+            "--model-draft=/tmp/draft.gguf",
+            "--mmproj",
+            "--chat-template-file=/tmp/template.jinja",
+            "--grammar-file",
+            "--lora=/tmp/adapter.gguf",
+            "--lora-scaled",
+            "--control-vector=/tmp/vector.gguf",
+            "--control-vector-scaled",
+            "--lookup-cache-static=/tmp/cache.bin",
+            "--lookup-cache-dynamic",
+        ] {
+            assert!(validate_extra_server_args(&[flag.to_string()]).is_err());
+        }
     }
 }

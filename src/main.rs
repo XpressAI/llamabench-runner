@@ -397,6 +397,8 @@ const SHOWCASE_PATH_FLAGS: &[&str] = &[
     "--slot-save-path",
 ];
 
+const SHOWCASE_SECRET_FLAGS: &[&str] = &["--api-key", "--api-key-file", "--hf-token"];
+
 fn redacted_showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
     let args = showcase_server_args(a);
     let mut redacted = Vec::with_capacity(args.len());
@@ -404,12 +406,22 @@ fn redacted_showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
     while index < args.len() {
         let arg = &args[index];
         if let Some((flag, value)) = arg.split_once('=') {
-            if SHOWCASE_PATH_FLAGS.contains(&flag) {
+            if SHOWCASE_SECRET_FLAGS.contains(&flag) {
+                index += 1;
+                continue;
+            } else if SHOWCASE_PATH_FLAGS.contains(&flag) {
                 redacted.push(format!("{flag}={}", redact_showcase_path(value)));
             } else {
                 redacted.push(arg.clone());
             }
         } else {
+            if SHOWCASE_SECRET_FLAGS.contains(&arg.as_str()) {
+                if args.get(index + 1).is_some() {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
             redacted.push(arg.clone());
             if SHOWCASE_PATH_FLAGS.contains(&arg.as_str()) {
                 if let Some(value) = args.get(index + 1) {
@@ -742,11 +754,15 @@ mod tests {
             "--server-arg",
             "--flash-attn",
             "--server-arg",
-            "--model-draft",
+            "--ssl-cert-file",
             "--server-arg",
-            "/home/alice/draft.gguf",
+            "/home/alice/cert.pem",
             "--server-arg",
-            "--mmproj=/private/models/mmproj.gguf",
+            "--hf-token",
+            "--server-arg",
+            "super-secret",
+            "--server-arg",
+            "--hf-token=also-secret",
         ]);
         let Command::Showcase(a) = cli.command else {
             panic!("expected showcase")
@@ -756,9 +772,10 @@ mod tests {
         assert!(command.contains("showcase --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--server-arg --flash-attn"));
         assert!(!command.contains("/home/edu"));
-        assert!(command.contains("--server-arg --model-draft --server-arg ./draft.gguf"));
-        assert!(command.contains("--server-arg --mmproj=./mmproj.gguf"));
+        assert!(command.contains("--server-arg --ssl-cert-file --server-arg ./cert.pem"));
         assert!(!command.contains("/home/alice"));
-        assert!(!command.contains("/private/models"));
+        assert!(!command.contains("hf-token"));
+        assert!(!command.contains("super-secret"));
+        assert!(!command.contains("also-secret"));
     }
 }
