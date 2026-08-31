@@ -1,0 +1,1 @@
+Thinking: A health response is not proof that it came from the process we just spawned. Reject an already-bound loopback port before launch and keep checking child liveness through readiness so evidence cannot be mislabeled with another server's model. Also accept common, semantically correct anachronism refusals so the inspectable role-play check matches its label.
