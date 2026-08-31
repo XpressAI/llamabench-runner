@@ -68,7 +68,7 @@ pub struct VerifySession<'a> {
 }
 
 /// Kills the spawned server on drop so we never leak a process.
-struct ServerGuard(Child);
+pub(crate) struct ServerGuard(Child);
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -87,7 +87,7 @@ fn session_of<'a>(opts: &'a VerifyOpts) -> VerifySession<'a> {
     }
 }
 
-fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
+pub(crate) fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
     let bin = Path::new(opts.server_bin_dir).join("llama-server");
     let port = opts.port.to_string();
     let mut cmd = Command::new(&bin);

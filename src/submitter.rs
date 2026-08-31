@@ -18,6 +18,7 @@ use crate::download;
 use crate::link;
 
 pub const DEFAULT_API: &str = "https://llamabench.ai/api/results";
+pub const DEFAULT_SHOWCASE_API: &str = "https://llamabench.ai/api/showcases";
 
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
@@ -412,6 +413,19 @@ pub fn submit(api: &str, token: &str, s: &ResultSubmission) -> Result<()> {
     match body.get("url").and_then(serde_json::Value::as_str) {
         Some(url) => eprintln!("✓ Submitted: {url}"),
         None => eprintln!("✓ submitted: {body}"),
+    }
+    Ok(())
+}
+
+pub fn submit_showcase(api: &str, token: &str, s: &AbilityShowcaseSubmission) -> Result<()> {
+    let resp = ureq::post(api)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(s)
+        .map_err(|e| anyhow::anyhow!("showcase submit failed: {e}"))?;
+    let body: serde_json::Value = resp.into_json()?;
+    match body.get("url").and_then(serde_json::Value::as_str) {
+        Some(url) => eprintln!("✓ Submitted ability showcase: {url}"),
+        None => eprintln!("✓ submitted ability showcase: {body}"),
     }
     Ok(())
 }

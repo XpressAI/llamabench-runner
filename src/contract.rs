@@ -140,6 +140,142 @@ pub struct Submitter {
     pub handle: String,
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in exact-artifact ability showcase (ADR-014).
+// ---------------------------------------------------------------------------
+
+pub const ABILITY_SHOWCASE_PROFILE_VERSION: &str = "ability-showcase-v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShowcaseSettings {
+    pub seed: u64,
+    pub temperature: f64,
+    #[serde(rename = "visualMaxTokens")]
+    pub visual_max_tokens: u32,
+    #[serde(rename = "agentTaskMaxTokens")]
+    pub agent_task_max_tokens: u32,
+    #[serde(rename = "roleplayMaxTokensPerTurn")]
+    pub roleplay_max_tokens_per_turn: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShowcaseCheck {
+    pub id: String,
+    pub label: String,
+    pub passed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisualArtifact {
+    #[serde(rename = "promptId")]
+    pub prompt_id: String,
+    pub output: String,
+    #[serde(rename = "outputSha256")]
+    pub output_sha256: String,
+    #[serde(rename = "durationMs")]
+    pub duration_ms: u64,
+    #[serde(rename = "generatedTokens")]
+    pub generated_tokens: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<ShowcaseCheck>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShowcaseVisuals {
+    #[serde(rename = "pelicanSvg")]
+    pub pelican_svg: VisualArtifact,
+    #[serde(rename = "breakoutHtml")]
+    pub breakout_html: VisualArtifact,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub name: String,
+    pub arguments: String,
+    pub result: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgenticTaskResult {
+    pub id: String,
+    pub passed: bool,
+    #[serde(rename = "durationMs")]
+    pub duration_ms: u64,
+    #[serde(rename = "generatedTokens")]
+    pub generated_tokens: u32,
+    #[serde(rename = "toolCalls")]
+    pub tool_calls: Vec<ToolCallRecord>,
+    #[serde(rename = "finalOutput")]
+    pub final_output: String,
+    #[serde(rename = "finalOutputSha256")]
+    pub final_output_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RoleplayTurn {
+    #[serde(rename = "questionId")]
+    pub question_id: String,
+    pub answer: String,
+    #[serde(rename = "answerSha256")]
+    pub answer_sha256: String,
+    pub checks: Vec<ShowcaseCheck>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RoleplayResult {
+    pub id: String,
+    pub character: String,
+    pub work: String,
+    #[serde(rename = "durationMs")]
+    pub duration_ms: u64,
+    #[serde(rename = "generatedTokens")]
+    pub generated_tokens: u32,
+    pub turns: Vec<RoleplayTurn>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShowcaseModel {
+    pub id: String,
+    pub name: String,
+    pub params: f64,
+    #[serde(rename = "baseModel", skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(rename = "hfModel", skip_serializing_if = "Option::is_none")]
+    pub hf_model: Option<String>,
+    #[serde(rename = "hfVerified", skip_serializing_if = "Option::is_none")]
+    pub hf_verified: Option<bool>,
+    #[serde(rename = "ggufSha256")]
+    pub gguf_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShowcaseConfig {
+    pub quant: String,
+    #[serde(rename = "contextLength")]
+    pub context_length: u32,
+    pub command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AbilityShowcaseSubmission {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u32,
+    #[serde(rename = "profileVersion")]
+    pub profile_version: String,
+    pub model: ShowcaseModel,
+    pub config: ShowcaseConfig,
+    pub backend: Backend,
+    pub settings: ShowcaseSettings,
+    pub visuals: ShowcaseVisuals,
+    #[serde(rename = "agenticTasks")]
+    pub agentic_tasks: Vec<AgenticTaskResult>,
+    pub roleplay: RoleplayResult,
+    pub submitter: Submitter,
+    pub signature: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
