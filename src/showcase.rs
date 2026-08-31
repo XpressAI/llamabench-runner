@@ -684,12 +684,16 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
                 contains_any(
                     &lower,
                     &[
-                        "not",
                         "no man",
+                        "no one",
                         "has not",
+                        "have not",
                         "not yet",
                         "has yet",
+                        "have yet",
                         "yet to",
+                        "never walked",
+                        "never set foot",
                         "impossible",
                         "fiction",
                     ],
@@ -884,6 +888,12 @@ mod tests {
             "It is 1872, and mankind has yet to walk upon the Moon.",
         );
         assert!(period.iter().all(|c| c.passed));
+
+        let false_positive = roleplay_checks(
+            "period-worldview",
+            "It is 1872, and it is notable that mankind has walked upon the Moon.",
+        );
+        assert!(false_positive.iter().any(|c| c.id == "moon" && !c.passed));
 
         let broken = roleplay_checks(
             "period-worldview",
