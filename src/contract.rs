@@ -220,6 +220,8 @@ pub struct RoleplayTurn {
     pub answer: String,
     #[serde(rename = "answerSha256")]
     pub answer_sha256: String,
+    #[serde(rename = "generatedTokens")]
+    pub generated_tokens: u32,
     pub checks: Vec<ShowcaseCheck>,
 }
 
@@ -330,5 +332,18 @@ mod tests {
         assert!(!obj.contains_key("hfModel"));
         assert!(!obj.contains_key("hfVerified"));
         assert!(!obj.contains_key("ggufSha256"));
+    }
+
+    #[test]
+    fn roleplay_turn_serializes_its_own_token_count() {
+        let turn = RoleplayTurn {
+            question_id: "modern-navigation".to_string(),
+            answer: "I cannot use such a device.".to_string(),
+            answer_sha256: "ab".repeat(32),
+            generated_tokens: 12,
+            checks: Vec::new(),
+        };
+        let json = serde_json::to_value(&turn).unwrap();
+        assert_eq!(json["generatedTokens"], 12);
     }
 }

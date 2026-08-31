@@ -507,12 +507,14 @@ fn run_roleplay(opts: &ShowcaseOpts) -> Result<RoleplayResult> {
     for (id, question) in questions {
         messages.push(json!({"role": "user", "content": question}));
         let reply = chat(opts, &messages, None, ROLEPLAY_MAX_TOKENS_PER_TURN)?;
-        generated_tokens += reply.generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN);
+        let turn_tokens = reply.generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN);
+        generated_tokens += turn_tokens;
         let answer = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
         messages.push(json!({"role": "assistant", "content": answer}));
         turns.push(RoleplayTurn {
             question_id: id.to_string(),
             answer_sha256: sha256_hex(&answer),
+            generated_tokens: turn_tokens,
             checks: roleplay_checks(id, &answer),
             answer,
         });
