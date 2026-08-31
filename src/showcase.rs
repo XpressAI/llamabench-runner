@@ -392,6 +392,10 @@ impl AgentHarness for DiscoveryHarness {
                     .to_string()
             }
             Some("/workspace/config/release.txt") => {
+                if !self.read_readme {
+                    self.invalid_calls += 1;
+                    return "ERROR: read /workspace/README.md first".to_string();
+                }
                 self.read_release = true;
                 "codename=NAUTILUS-47\nchannel=stable\n".to_string()
             }
@@ -684,7 +688,16 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
                 "Uses period-appropriate navigation or transport",
                 contains_any(
                     &lower,
-                    &["map", "timetable", "rail", "train", "steamer", "steamship"],
+                    &[
+                        "paper map",
+                        "printed map",
+                        "atlas",
+                        "timetable",
+                        "rail",
+                        "train",
+                        "steamer",
+                        "steamship",
+                    ],
                 ),
             ));
         }
@@ -693,23 +706,7 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
             checks.push(check(
                 "moon",
                 "Does not claim a completed Moon landing",
-                contains_any(
-                    &lower,
-                    &[
-                        "no man",
-                        "no one",
-                        "has not",
-                        "have not",
-                        "not yet",
-                        "has yet",
-                        "have yet",
-                        "yet to",
-                        "never walked",
-                        "never set foot",
-                        "impossible",
-                        "fiction",
-                    ],
-                ) && !contains_any(&lower, &["apollo", "1969"]),
+                denies_moon_landing(&lower),
             ));
         }
         _ => {}
@@ -718,20 +715,74 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
 }
 
 fn rejects_modern_navigation(answer: &str) -> bool {
-    contains_any(answer, &["smartphone", "gps", "such a device"])
+    contains_any(
+        answer,
+        &[
+            "do not possess a smartphone",
+            "do not possess such a device",
+            "possess no smartphone",
+            "possess no such device",
+            "cannot use a smartphone",
+            "cannot use gps",
+            "cannot use such a device",
+            "can't use a smartphone",
+            "can't use gps",
+            "can't use such a device",
+            "do not have a smartphone",
+            "do not have gps",
+            "don't have a smartphone",
+            "don't have gps",
+            "no such device",
+            "no smartphone",
+            "smartphone is unknown to me",
+            "gps is unknown to me",
+            "unfamiliar with a smartphone",
+            "unfamiliar with smartphones",
+            "unfamiliar with gps",
+            "what is a smartphone",
+            "what is gps",
+        ],
+    )
+}
+
+fn denies_moon_landing(answer: &str) -> bool {
+    !contains_any(answer, &["apollo", "1969"])
         && contains_any(
             answer,
             &[
-                "do not possess",
-                "possess no",
-                "cannot use",
-                "can't use",
-                "do not have",
-                "don't have",
-                "no such",
-                "unknown to me",
-                "unfamiliar with",
-                "what is a",
+                "no man has walked on the moon",
+                "no man has walked upon the moon",
+                "no man has set foot on the moon",
+                "no man has set foot upon the moon",
+                "no one has walked on the moon",
+                "no one has walked upon the moon",
+                "no one has set foot on the moon",
+                "no one has set foot upon the moon",
+                "mankind has not walked on the moon",
+                "mankind has not walked upon the moon",
+                "mankind has not landed on the moon",
+                "man has not walked on the moon",
+                "man has not walked upon the moon",
+                "man has not landed on the moon",
+                "has not yet walked on the moon",
+                "has not yet walked upon the moon",
+                "has not yet landed on the moon",
+                "has yet to walk on the moon",
+                "has yet to walk upon the moon",
+                "has yet to land on the moon",
+                "have yet to walk on the moon",
+                "have yet to walk upon the moon",
+                "yet to walk on the moon",
+                "yet to walk upon the moon",
+                "never walked on the moon",
+                "never walked upon the moon",
+                "never set foot on the moon",
+                "never set foot upon the moon",
+                "the moon has not been visited",
+                "the moon has yet to be visited",
+                "no moon landing",
+                "moon landing is impossible",
+                "moon landing is fiction",
             ],
         )
 }
@@ -905,6 +956,14 @@ mod tests {
             .contains("NAUTILUS-47"));
         assert!(h.passed("NAUTILUS-47"));
         assert!(!h.passed("The codename is not NAUTILUS-47"));
+
+        let mut guessed = DiscoveryHarness::default();
+        assert!(!guessed
+            .execute("read_file", r#"{"path":"/workspace/config/release.txt"}"#)
+            .contains("NAUTILUS-47"));
+        guessed.execute("read_file", r#"{"path":"/workspace/README.md"}"#);
+        guessed.execute("read_file", r#"{"path":"/workspace/config/release.txt"}"#);
+        assert!(!guessed.passed("NAUTILUS-47"));
     }
 
     #[test]
@@ -962,6 +1021,14 @@ mod tests {
             .iter()
             .any(|c| c.id == "rejects-anachronism" && !c.passed));
 
+        let unrelated_refusal = roleplay_checks(
+            "modern-navigation",
+            "I can't use a paper map; my smartphone's GPS will guide me.",
+        );
+        assert!(unrelated_refusal
+            .iter()
+            .any(|c| c.id == "rejects-anachronism" && !c.passed));
+
         let period = roleplay_checks(
             "period-worldview",
             "It is 1872, and mankind has yet to walk upon the Moon.",
@@ -973,6 +1040,14 @@ mod tests {
             "It is 1872, and it is notable that mankind has walked upon the Moon.",
         );
         assert!(false_positive.iter().any(|c| c.id == "moon" && !c.passed));
+
+        let qualified_false_positive = roleplay_checks(
+            "period-worldview",
+            "It is 1872; no one doubts that mankind has walked upon the Moon.",
+        );
+        assert!(qualified_false_positive
+            .iter()
+            .any(|c| c.id == "moon" && !c.passed));
 
         let broken = roleplay_checks(
             "period-worldview",
