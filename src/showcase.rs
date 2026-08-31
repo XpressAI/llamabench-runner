@@ -110,8 +110,7 @@ pub fn run_showcase(opts: &ShowcaseOpts) -> Result<ShowcaseRun> {
         extra_server_args: server_args,
     };
     let _guard = verify::spawn_server(&verify_opts)?;
-    let context_length =
-        server_context(opts.port, Some(opts.api_key)).unwrap_or(opts.context_length);
+    let context_length = server_context(opts.port, Some(opts.api_key))?;
 
     eprintln!("\n▸ [1/5] Visual — pelican SVG (≤ {VISUAL_MAX_TOKENS} generated tokens)");
     let pelican_svg = run_visual(
@@ -803,16 +802,31 @@ pub fn server_version(dir: &str) -> (String, String) {
     ("unknown".to_string(), "unknown".to_string())
 }
 
-fn server_context(port: u16, api_key: Option<&str>) -> Option<u32> {
+fn server_context(port: u16, api_key: Option<&str>) -> Result<u32> {
     let url = format!("http://127.0.0.1:{port}/props");
     let mut req = ureq::get(&url).timeout(Duration::from_secs(10));
     if let Some(key) = api_key {
         req = req.set("Authorization", &format!("Bearer {key}"));
     }
-    let v: Value = req.call().ok()?.into_json().ok()?;
-    v["default_generation_settings"]["n_ctx"]
+    let response = req
+        .call()
+        .map_err(|error| anyhow::anyhow!("reading llama-server effective context: {error}"))?;
+    let props: Value = response
+        .into_json()
+        .context("decoding llama-server /props response")?;
+    effective_context_from_props(&props)
+}
+
+fn effective_context_from_props(props: &Value) -> Result<u32> {
+    let value = props["default_generation_settings"]["n_ctx"]
         .as_u64()
-        .map(|n| n as u32)
+        .context("llama-server /props omitted default_generation_settings.n_ctx")?;
+    let context =
+        u32::try_from(value).context("llama-server reported an invalid effective context")?;
+    if context == 0 {
+        bail!("llama-server reported an effective context of zero");
+    }
+    Ok(context)
 }
 
 #[cfg(test)]
@@ -933,6 +947,20 @@ mod tests {
         assert_eq!(s.visual_max_tokens, 1024);
         assert_eq!(s.agent_task_max_tokens, 256);
         assert_eq!(s.roleplay_max_tokens_per_turn, 96);
+    }
+
+    #[test]
+    fn effective_context_requires_server_reported_value() {
+        assert_eq!(
+            effective_context_from_props(&json!({"default_generation_settings": {"n_ctx": 4096}}))
+                .unwrap(),
+            4096
+        );
+        assert!(effective_context_from_props(&json!({})).is_err());
+        assert!(effective_context_from_props(
+            &json!({"default_generation_settings": {"n_ctx": 0}})
+        )
+        .is_err());
     }
 
     #[test]
