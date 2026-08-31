@@ -1,0 +1,1 @@
+Thinking: The existing filename heuristic chose the last B-suffixed number, which makes a 35B-A3B MoE look like a 3B model in showcase-only catalog entries. Selecting the largest B-valued token preserves existing dense-model behavior and matches the catalog's total-parameter field; active parameters remain separate metadata when available.
