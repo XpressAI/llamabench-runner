@@ -1,0 +1,1 @@
+Thinking: ADR-014 promises exact-artifact, reproducible showcase evidence. Exact identity therefore bypasses the size-plus-mtime hash cache; recorded commands redact model-adjacent path arguments; and the discovery grader accepts only the exact codename so negated mentions cannot pass. Regression coverage exercises all three boundaries.
