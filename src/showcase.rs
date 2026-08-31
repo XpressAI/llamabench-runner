@@ -395,6 +395,8 @@ impl AgentHarness for DiscoveryHarness {
 
 struct RepairHarness {
     config: String,
+    read_config: bool,
+    read_before_write: bool,
     wrote_config: bool,
     ran_passing_tests: bool,
     invalid_writes: u32,
@@ -404,6 +406,8 @@ impl Default for RepairHarness {
     fn default() -> Self {
         Self {
             config: r#"{"port":"8080","debug":true}"#.to_string(),
+            read_config: false,
+            read_before_write: false,
             wrote_config: false,
             ran_passing_tests: false,
             invalid_writes: 0,
@@ -475,7 +479,10 @@ impl AgentHarness for RepairHarness {
     fn execute(&mut self, name: &str, arguments: &str) -> String {
         match name {
             "read_file" => match json_string_arg(arguments, "path").as_deref() {
-                Some("/workspace/config.json") => self.config.clone(),
+                Some("/workspace/config.json") => {
+                    self.read_config = true;
+                    self.config.clone()
+                }
                 _ => "ERROR: file not found".to_string(),
             },
             "write_file" => {
@@ -489,6 +496,7 @@ impl AgentHarness for RepairHarness {
                 let Some(content) = content else {
                     return "ERROR: content must be a string".to_string();
                 };
+                self.read_before_write |= self.read_config;
                 self.config = bounded(&content, 4_000);
                 self.wrote_config = true;
                 "OK: wrote /workspace/config.json".to_string()
@@ -506,7 +514,12 @@ impl AgentHarness for RepairHarness {
     }
 
     fn passed(&self, _final_output: &str) -> bool {
-        self.wrote_config && self.invalid_writes == 0 && self.ran_passing_tests && self.tests_pass()
+        self.read_config
+            && self.read_before_write
+            && self.wrote_config
+            && self.invalid_writes == 0
+            && self.ran_passing_tests
+            && self.tests_pass()
     }
 }
 
@@ -848,12 +861,21 @@ mod tests {
     #[test]
     fn repair_rejects_collateral_writes_and_requires_tests() {
         let mut good = RepairHarness::default();
+        good.execute("read_file", r#"{"path":"/workspace/config.json"}"#);
         good.execute(
             "write_file",
             r#"{"path":"/workspace/config.json","content":"{\"port\":8080,\"debug\":false}"}"#,
         );
         assert!(good.execute("run_tests", "{}").starts_with("PASS"));
         assert!(good.passed("done"));
+
+        let mut skipped_read = RepairHarness::default();
+        skipped_read.execute(
+            "write_file",
+            r#"{"path":"/workspace/config.json","content":"{\"port\":8080,\"debug\":false}"}"#,
+        );
+        skipped_read.execute("run_tests", "{}");
+        assert!(!skipped_read.passed("done"));
 
         let mut bad = RepairHarness::default();
         bad.execute(
