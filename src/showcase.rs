@@ -28,6 +28,21 @@ const PELICAN_PROMPT: &str = "Generate an SVG of a pelican riding a bicycle";
 const BREAKOUT_PROMPT: &str = "Can you make a simple breakout game in HTML?";
 const MAX_OUTPUT_CHARS: usize = 131_072;
 const MAX_EVIDENCE_CHARS: usize = 4_000;
+const CONTROLLED_SERVER_FLAGS: &[&str] = &[
+    "-m",
+    "--model",
+    "-mu",
+    "--model-url",
+    "-hf",
+    "-hfr",
+    "--hf-repo",
+    "-hff",
+    "--hf-file",
+    "--host",
+    "--port",
+    "--api-key",
+    "--api-key-file",
+];
 
 pub struct ShowcaseOpts<'a> {
     pub server_bin_dir: &'a str,
@@ -80,6 +95,7 @@ pub fn settings() -> ShowcaseSettings {
 }
 
 pub fn run_showcase(opts: &ShowcaseOpts) -> Result<ShowcaseRun> {
+    validate_extra_server_args(&opts.extra_server_args)?;
     let mut server_args = vec!["-c".to_string(), opts.context_length.to_string()];
     server_args.extend(opts.extra_server_args.clone());
     let verify_opts = VerifyOpts {
@@ -141,6 +157,18 @@ pub fn run_showcase(opts: &ShowcaseOpts) -> Result<ShowcaseRun> {
         roleplay,
         context_length,
     })
+}
+
+fn validate_extra_server_args(args: &[String]) -> Result<()> {
+    for arg in args {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if CONTROLLED_SERVER_FLAGS.contains(&flag) {
+            bail!(
+                "{flag} is controlled by `llamabench showcase`; use the corresponding showcase option instead"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_visual(
@@ -660,6 +688,8 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
                         "no man",
                         "has not",
                         "not yet",
+                        "has yet",
+                        "yet to",
                         "impossible",
                         "fiction",
                     ],
@@ -849,6 +879,12 @@ mod tests {
         );
         assert!(common_refusal.iter().all(|c| c.passed));
 
+        let period = roleplay_checks(
+            "period-worldview",
+            "It is 1872, and mankind has yet to walk upon the Moon.",
+        );
+        assert!(period.iter().all(|c| c.passed));
+
         let broken = roleplay_checks(
             "period-worldview",
             "As an AI language model, I know Apollo landed in 1969.",
@@ -864,5 +900,18 @@ mod tests {
         assert_eq!(s.visual_max_tokens, 1024);
         assert_eq!(s.agent_task_max_tokens, 256);
         assert_eq!(s.roleplay_max_tokens_per_turn, 96);
+    }
+
+    #[test]
+    fn extra_server_args_cannot_override_showcase_identity_or_transport() {
+        for flag in ["-m", "--model=/tmp/other.gguf", "--hf-repo", "--port=9090"] {
+            assert!(validate_extra_server_args(&[flag.to_string()]).is_err());
+        }
+        validate_extra_server_args(&[
+            "--flash-attn".to_string(),
+            "--spec-type".to_string(),
+            "draft-mtp".to_string(),
+        ])
+        .unwrap();
     }
 }
