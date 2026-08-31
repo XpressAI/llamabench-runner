@@ -677,22 +677,7 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
             checks.push(check(
                 "rejects-anachronism",
                 "Treats smartphone/GPS as unavailable or unknown",
-                contains_any(
-                    &lower,
-                    &[
-                        "do not possess",
-                        "possess no",
-                        "cannot",
-                        "can't",
-                        "do not have",
-                        "don't have",
-                        "no such",
-                        "unknown to me",
-                        "unfamiliar",
-                        "what is a",
-                        "have no",
-                    ],
-                ),
+                rejects_modern_navigation(&lower),
             ));
             checks.push(check(
                 "period-navigation",
@@ -730,6 +715,25 @@ fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
         _ => {}
     }
     checks
+}
+
+fn rejects_modern_navigation(answer: &str) -> bool {
+    contains_any(answer, &["smartphone", "gps", "such a device"])
+        && contains_any(
+            answer,
+            &[
+                "do not possess",
+                "possess no",
+                "cannot use",
+                "can't use",
+                "do not have",
+                "don't have",
+                "no such",
+                "unknown to me",
+                "unfamiliar with",
+                "what is a",
+            ],
+        )
 }
 
 fn check(id: &str, label: &str, passed: bool) -> ShowcaseCheck {
@@ -949,6 +953,14 @@ mod tests {
             "I cannot use a smartphone; I would consult a railway timetable.",
         );
         assert!(common_refusal.iter().all(|c| c.passed));
+
+        let embraces_anachronism = roleplay_checks(
+            "modern-navigation",
+            "I have no difficulty using the smartphone map; GPS tells me the route.",
+        );
+        assert!(embraces_anachronism
+            .iter()
+            .any(|c| c.id == "rejects-anachronism" && !c.passed));
 
         let period = roleplay_checks(
             "period-worldview",

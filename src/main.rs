@@ -533,6 +533,15 @@ fn showcase_submission(
     }
 }
 
+fn ensure_showcase_hash_unchanged(before: &str, after: &str) -> Result<()> {
+    if before != after {
+        bail!(
+            "model artifact changed while the ability showcase was running; refusing to submit evidence for ambiguous bytes"
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Drop-in dispatch (ADR-009) happens before clap: `llamabench <llama-bench
     // args>` (bare flags), `llamabench llama-bench …`, `llamabench llama-server …`.
@@ -655,6 +664,8 @@ fn main() -> Result<()> {
                 context_length: a.context_length,
                 extra_server_args: showcase_server_args(&a),
             })?;
+            let final_gguf_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_showcase_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
             let mut submission = showcase_submission(
                 &a,
                 &model,
@@ -777,5 +788,11 @@ mod tests {
         assert!(!command.contains("hf-token"));
         assert!(!command.contains("super-secret"));
         assert!(!command.contains("also-secret"));
+    }
+
+    #[test]
+    fn showcase_submission_requires_stable_artifact_bytes() {
+        assert!(ensure_showcase_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_showcase_hash_unchanged("abc", "def").is_err());
     }
 }
