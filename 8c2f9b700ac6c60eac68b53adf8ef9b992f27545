@@ -1,0 +1,1 @@
+Thinking: Extra llama-server tuning remains useful, but identity and transport flags must have a single owner or the bytes we hash can differ from the model actually serving requests. Reject those controlled flags while preserving ordinary tuning/speculation args; widen the literal rule check for historically correct 'has yet' phrasing.
