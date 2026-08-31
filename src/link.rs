@@ -44,6 +44,16 @@ fn file_sha256_progress(path: &Path, total: u64) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// Hash a local model from its current bytes, deliberately bypassing the
+/// size+mtime cache. Exact-artifact showcases use this stronger identity rule
+/// because a same-size replacement can preserve a coarse filesystem timestamp.
+pub fn fresh_sha256_for(model: &str) -> Result<String> {
+    let key = key_for(model)?;
+    let (size, _) = file_meta(&key)?;
+    eprintln!("  hashing {} for exact-artifact identity…", short(model));
+    file_sha256_progress(Path::new(&key), size)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -292,9 +302,14 @@ mod tests {
         path.push(format!("llamabench_sha256_{}.bin", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         let got = file_sha256(&path);
+        let fresh = fresh_sha256_for(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             got.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            fresh.unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }

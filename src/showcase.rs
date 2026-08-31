@@ -389,7 +389,7 @@ impl AgentHarness for DiscoveryHarness {
         self.read_readme
             && self.read_release
             && self.invalid_calls == 0
-            && final_output.to_ascii_uppercase().contains("NAUTILUS-47")
+            && final_output.trim().eq_ignore_ascii_case("NAUTILUS-47")
     }
 }
 
@@ -856,6 +856,7 @@ mod tests {
             .execute("read_file", r#"{"path":"/workspace/config/release.txt"}"#)
             .contains("NAUTILUS-47"));
         assert!(h.passed("NAUTILUS-47"));
+        assert!(!h.passed("The codename is not NAUTILUS-47"));
     }
 
     #[test]

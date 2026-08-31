@@ -379,10 +379,62 @@ fn showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
         .collect()
 }
 
+const SHOWCASE_PATH_FLAGS: &[&str] = &[
+    "-md",
+    "--model-draft",
+    "--mmproj",
+    "--chat-template-file",
+    "--grammar-file",
+    "--lora",
+    "--lora-scaled",
+    "--control-vector",
+    "--control-vector-scaled",
+    "--lookup-cache-static",
+    "--lookup-cache-dynamic",
+    "--ssl-key-file",
+    "--ssl-cert-file",
+    "--log-file",
+    "--slot-save-path",
+];
+
+fn redacted_showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
+    let args = showcase_server_args(a);
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some((flag, value)) = arg.split_once('=') {
+            if SHOWCASE_PATH_FLAGS.contains(&flag) {
+                redacted.push(format!("{flag}={}", redact_showcase_path(value)));
+            } else {
+                redacted.push(arg.clone());
+            }
+        } else {
+            redacted.push(arg.clone());
+            if SHOWCASE_PATH_FLAGS.contains(&arg.as_str()) {
+                if let Some(value) = args.get(index + 1) {
+                    redacted.push(redact_showcase_path(value));
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+    redacted
+}
+
+fn redact_showcase_path(value: &str) -> String {
+    let file = std::path::Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    format!("./{file}")
+}
+
 fn shell_word(value: &str) -> String {
     if value
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-._/:".contains(c))
+        .all(|c| c.is_ascii_alphanumeric() || "-._/:=".contains(c))
     {
         value.to_string()
     } else {
@@ -408,7 +460,7 @@ fn showcase_command(a: &ShowcaseArgs, model: &str, quant: &str) -> String {
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
     }
-    for arg in showcase_server_args(a) {
+    for arg in redacted_showcase_server_args(a) {
         parts.extend(["--server-arg".to_string(), shell_word(&arg)]);
     }
     parts.join(" ")
@@ -580,11 +632,7 @@ fn main() -> Result<()> {
                 &["llama-server"],
             )?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
-            let gguf_sha256 = link::sha256_for(&model).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "ability showcases require a readable local GGUF so its exact SHA-256 can be recorded"
-                )
-            })?;
+            let gguf_sha256 = link::fresh_sha256_for(&model)?;
             let hf = provenance(&showcase_model_source(&a, &model), &quant);
             let (backend_version, backend_hash) = showcase::server_version(&dir);
             let run = showcase::run_showcase(&showcase::ShowcaseOpts {
@@ -693,6 +741,12 @@ mod tests {
             "/home/edu/model-Q4_K_M.gguf",
             "--server-arg",
             "--flash-attn",
+            "--server-arg",
+            "--model-draft",
+            "--server-arg",
+            "/home/alice/draft.gguf",
+            "--server-arg",
+            "--mmproj=/private/models/mmproj.gguf",
         ]);
         let Command::Showcase(a) = cli.command else {
             panic!("expected showcase")
@@ -702,5 +756,9 @@ mod tests {
         assert!(command.contains("showcase --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--server-arg --flash-attn"));
         assert!(!command.contains("/home/edu"));
+        assert!(command.contains("--server-arg --model-draft --server-arg ./draft.gguf"));
+        assert!(command.contains("--server-arg --mmproj=./mmproj.gguf"));
+        assert!(!command.contains("/home/alice"));
+        assert!(!command.contains("/private/models"));
     }
 }
