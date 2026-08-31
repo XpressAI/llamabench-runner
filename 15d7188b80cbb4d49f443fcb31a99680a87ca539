@@ -1,0 +1,1 @@
+Thinking: ADR-014 groups evidence by the server's effective context, not the requested value. Falling back to the request when /props is unavailable can silently mislabel fork behavior, so the showcase now requires a valid positive n_ctx report and fails explicitly otherwise. A small parser test covers valid, absent, and zero values.
