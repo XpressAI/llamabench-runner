@@ -1,0 +1,1 @@
+Thinking: The contract now treats bounded per-turn counts as the only role-play token evidence. Removing the redundant aggregate prevents cross-field contradictions while preserving a trivially derived total for presentation; the fixed question array already emits the canonical conversational order.
