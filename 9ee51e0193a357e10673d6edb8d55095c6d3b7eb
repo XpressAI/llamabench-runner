@@ -1,0 +1,1 @@
+Thinking: The profile advertises a hard per-turn role-play cap, so emit the observed completion-token count on every answer as well as the aggregate. This lets the server enforce the cap and lets readers audit the cost of each response.
