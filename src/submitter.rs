@@ -160,6 +160,27 @@ pub fn provenance(source: &ModelSource, quant: &str) -> HfProvenance {
     }
 }
 
+/// Provenance for an artifact whose current bytes have already been freshly
+/// hashed. This avoids trusting a size-only download cache or a size+mtime link
+/// cache when an exact-artifact showcase is attributed.
+pub fn provenance_exact(source: &ModelSource, quant: &str, sha256: &str) -> HfProvenance {
+    match source {
+        ModelSource::Downloaded(repo) | ModelSource::LocalWithRepo(_, repo) => HfProvenance {
+            model: Some(repo.to_string()),
+            verified: Some(verify_hf_sha256(repo, quant, sha256)),
+            canonical: resolve_canonical(repo),
+        },
+        ModelSource::LocalOnly(model) => match link::resolve_with_sha256(model, sha256) {
+            Some(link) => HfProvenance {
+                model: Some(link.repo.clone()),
+                verified: Some(link.verified),
+                canonical: resolve_canonical(&link.repo),
+            },
+            None => HfProvenance::none(),
+        },
+    }
+}
+
 /// Verify a local GGUF against the HF repo it claims to be, by SHA-256. HF publishes
 /// each LFS file's sha256 as its `lfs.oid` (tree API), so we stream-hash the local
 /// file and compare — no re-download. Network/resolution failures are non-fatal: they
@@ -174,13 +195,17 @@ fn verify_hf_hash(model: &str, repo: &str, quant: &str) -> bool {
             return false;
         }
     };
+    verify_hf_sha256(repo, quant, &local)
+}
+
+fn verify_hf_sha256(repo: &str, quant: &str, local: &str) -> bool {
     match download::hf_expected_sha256(repo, quant) {
         Ok(Some(expected)) if local.eq_ignore_ascii_case(&expected) => {
             eprintln!("✓ HF hash verified: matches {repo}");
             true
         }
         Ok(Some(_)) => {
-            eprintln!("⚠ HF hash MISMATCH: local file differs from {repo} ({model})");
+            eprintln!("⚠ HF hash MISMATCH: exact artifact differs from {repo}");
             false
         }
         Ok(None) => {

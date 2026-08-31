@@ -773,30 +773,45 @@ pub fn sign(s: &mut AbilityShowcaseSubmission) -> Result<()> {
     Ok(())
 }
 
-pub fn server_version(dir: &str) -> (String, String) {
+pub fn server_version(dir: &str) -> Result<(String, String)> {
     let bin = Path::new(dir).join("llama-server");
-    if let Ok(out) = Command::new(&bin).arg("--version").output() {
-        for text in [&out.stderr, &out.stdout] {
-            for line in String::from_utf8_lossy(text).lines() {
-                let Some(rest) = line.trim().strip_prefix("version:") else {
-                    continue;
-                };
-                let mut parts = rest.split_whitespace();
-                let Some(number) = parts.next() else { continue };
-                let Some(hash) = parts
-                    .next()
-                    .and_then(|v| v.strip_prefix('('))
-                    .and_then(|v| v.strip_suffix(')'))
-                else {
-                    continue;
-                };
-                if number.chars().all(|c| c.is_ascii_digit()) {
-                    return (format!("b{number}"), hash.to_string());
-                }
-            }
+    let output = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {} --version", bin.display()))?;
+    for text in [&output.stderr, &output.stdout] {
+        if let Some(version) = parse_server_version(&String::from_utf8_lossy(text)) {
+            return Ok(version);
         }
     }
-    ("unknown".to_string(), "unknown".to_string())
+    bail!(
+        "could not determine an exact backend build from {} --version; refusing to publish ambiguous showcase evidence",
+        bin.display()
+    )
+}
+
+fn parse_server_version(text: &str) -> Option<(String, String)> {
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("version:") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(number) = parts.next() else { continue };
+        let Some(hash) = parts
+            .next()
+            .and_then(|value| value.strip_prefix('('))
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            continue;
+        };
+        if number.chars().all(|character| character.is_ascii_digit())
+            && hash.len() >= 7
+            && hash.chars().all(|character| character.is_ascii_hexdigit())
+        {
+            return Some((format!("b{number}"), hash.to_string()));
+        }
+    }
+    None
 }
 
 fn server_context(port: u16, api_key: Option<&str>) -> Result<u32> {
@@ -958,6 +973,16 @@ mod tests {
             &json!({"default_generation_settings": {"n_ctx": 0}})
         )
         .is_err());
+    }
+
+    #[test]
+    fn backend_build_parser_requires_exact_version_and_hash() {
+        assert_eq!(
+            parse_server_version("version: 9999 (abcdef12)\n").unwrap(),
+            ("b9999".to_string(), "abcdef12".to_string())
+        );
+        assert!(parse_server_version("llama.cpp custom build").is_none());
+        assert!(parse_server_version("version: unknown (unknown)").is_none());
     }
 
     #[test]

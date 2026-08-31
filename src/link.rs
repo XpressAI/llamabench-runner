@@ -291,6 +291,54 @@ pub fn resolve(model: &str) -> Option<Resolved> {
     Some(Resolved { repo, verified })
 }
 
+/// Resolve a stored link against a hash already computed from the current file
+/// bytes. Exact-artifact callers use this instead of the size+mtime shortcut.
+pub fn resolve_with_sha256(model: &str, sha256: &str) -> Option<Resolved> {
+    let key = key_for(model).ok()?;
+    let entry = config::links().get(&key).cloned()?;
+    let Ok((size, mtime)) = file_meta(&key) else {
+        return None;
+    };
+    if entry.sha256.eq_ignore_ascii_case(sha256) {
+        eprintln!(
+            "→ provenance: {} (linked, {})",
+            entry.repo,
+            if entry.verified {
+                "hash-verified"
+            } else {
+                "NOT verified"
+            }
+        );
+        return Some(Resolved {
+            repo: entry.repo,
+            verified: entry.verified,
+        });
+    }
+
+    eprintln!(
+        "↻ {} bytes differ from its stored link — re-verifying against {}",
+        short(&key),
+        entry.repo
+    );
+    let matched = download::hf_file_by_sha256(&entry.repo, sha256)
+        .ok()
+        .flatten();
+    let verified = matched.is_some();
+    let repo = entry.repo.clone();
+    let _ = config::upsert_link(
+        &key,
+        LinkEntry {
+            repo: entry.repo,
+            file: matched.unwrap_or_default(),
+            sha256: sha256.to_string(),
+            size,
+            mtime,
+            verified,
+        },
+    );
+    Some(Resolved { repo, verified })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

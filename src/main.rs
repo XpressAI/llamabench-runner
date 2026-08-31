@@ -33,8 +33,8 @@ use contract::{
     ABILITY_SHOWCASE_PROFILE_VERSION, SCHEMA_VERSION,
 };
 use submitter::{
-    build_submission, provenance, resolved_quant, BuildCtx, Family, HfProvenance, ModelSource,
-    DEFAULT_API, DEFAULT_SHOWCASE_API,
+    build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
+    ModelSource, DEFAULT_API, DEFAULT_SHOWCASE_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -633,8 +633,8 @@ fn main() -> Result<()> {
             )?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let gguf_sha256 = link::fresh_sha256_for(&model)?;
-            let hf = provenance(&showcase_model_source(&a, &model), &quant);
-            let (backend_version, backend_hash) = showcase::server_version(&dir);
+            let hf = provenance_exact(&showcase_model_source(&a, &model), &quant, &gguf_sha256);
+            let (backend_version, backend_hash) = showcase::server_version(&dir)?;
             let run = showcase::run_showcase(&showcase::ShowcaseOpts {
                 server_bin_dir: &dir,
                 model: &model,
