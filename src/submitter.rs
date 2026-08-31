@@ -258,8 +258,10 @@ pub fn params_from_name(name: &str) -> f64 {
                 .filter(|rest| !rest.is_empty())
                 .and_then(|rest| rest.parse::<f64>().ok())
         })
-        .next_back()
-        .unwrap_or(0.0)
+        // MoE names often include both total and active sizes (35B-A3B). The
+        // catalog's `params` is total parameters, so the largest B-valued token
+        // is the least-wrong filename-only fallback.
+        .fold(0.0, f64::max)
 }
 
 /// Everything the caller (classic or drop-in) decides about a submission; the
@@ -566,6 +568,7 @@ mod tests {
         assert_eq!(params_from_name("gemma-4-12b-it-UD-Q4_K_XL"), 12.0);
         assert_eq!(params_from_name("Llama-3.2-1B-Instruct-Q4_K_M"), 1.0);
         assert_eq!(params_from_name("Qwen3.5-0.6B"), 0.6);
+        assert_eq!(params_from_name("Ornith-1.0-35B-A3B"), 35.0);
         // "3.1" (version) must not be read as a size; "8B" wins.
         assert_eq!(params_from_name("Meta-Llama-3.1-8B"), 8.0);
         assert_eq!(params_from_name("mystery-model"), 0.0);
