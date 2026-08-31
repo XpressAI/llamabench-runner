@@ -543,12 +543,10 @@ fn run_roleplay(opts: &ShowcaseOpts) -> Result<RoleplayResult> {
         ),
     ];
     let mut turns = Vec::new();
-    let mut generated_tokens = 0u32;
     for (id, question) in questions {
         messages.push(json!({"role": "user", "content": question}));
         let reply = chat(opts, &messages, None, ROLEPLAY_MAX_TOKENS_PER_TURN)?;
         let turn_tokens = reply.generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN);
-        generated_tokens += turn_tokens;
         let answer = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
         messages.push(json!({"role": "assistant", "content": answer}));
         turns.push(RoleplayTurn {
@@ -564,7 +562,6 @@ fn run_roleplay(opts: &ShowcaseOpts) -> Result<RoleplayResult> {
         character: "Phileas Fogg".to_string(),
         work: "Around the World in Eighty Days".to_string(),
         duration_ms: elapsed_ms(start),
-        generated_tokens: generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN * 3),
         turns,
     })
 }

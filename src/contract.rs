@@ -232,8 +232,6 @@ pub struct RoleplayResult {
     pub work: String,
     #[serde(rename = "durationMs")]
     pub duration_ms: u64,
-    #[serde(rename = "generatedTokens")]
-    pub generated_tokens: u32,
     pub turns: Vec<RoleplayTurn>,
 }
 
