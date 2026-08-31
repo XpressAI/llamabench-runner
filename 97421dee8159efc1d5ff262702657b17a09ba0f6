@@ -1,0 +1,1 @@
+Thinking: Bare substring 'not' is not a defensible historical-knowledge signal because words like 'notable' satisfy it. Keep the transparent heuristic but require explicit denial phrases near the claimed event, and lock the reported false-positive example into a regression test.
