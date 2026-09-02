@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! llamabench.ai benchmark runner (ADR-004, ADR-005, ADR-009).
 //!
-//! Two ways in:
+//! Two primary workflows:
 //!
-//! * **Drop-in** (the primary interface): replace the program name in the command
-//!   you already run. `llama-bench -m x.gguf -ngl 99` → `llamabench -m x.gguf
-//!   -ngl 99`; `llama-server -m x.gguf -c 8192` → `llamabench llama-server -m
-//!   x.gguf -c 8192`. Your exact configuration runs, the literal command is
-//!   recorded, and the result is submitted. See `dropin.rs`.
-//! * **Classic subcommands**: `run`/`bench`/`verify` with llamabench-owned flags
-//!   (still what the submit page generates), plus `auth` and `link`.
+//! * **Speed**: runner-owned options, one `--` boundary, then an exact native
+//!   `llama-bench` or `llama-server` command. See `dropin.rs`.
+//! * **Evaluation**: runner-owned identity/transport options, one `--` boundary,
+//!   then exact native `llama-server` tuning arguments. See `eval.rs`.
+//!
+//! Bare drop-in commands and classic `run`/`bench`/`verify` remain as hidden
+//! compatibility surfaces for v0.4.x scripts.
 //!
 //! It drives the user's *existing* llama.cpp build and bundles nothing.
 
@@ -19,8 +19,8 @@ mod contract;
 mod detect;
 mod download;
 mod dropin;
+mod eval;
 mod link;
-mod showcase;
 mod submitter;
 mod verify;
 
@@ -29,12 +29,12 @@ use clap::{Args, Parser, Subcommand};
 
 use bench::{run_llama_bench, BenchOpts, BenchResult};
 use contract::{
-    AbilityShowcaseSubmission, Backend, ShowcaseConfig, ShowcaseModel, Submitter, Verification,
-    ABILITY_SHOWCASE_PROFILE_VERSION, SCHEMA_VERSION,
+    Backend, EvaluationConfig, EvaluationModel, EvaluationSubmission, Submitter, Verification,
+    EVAL_VERSION, SCHEMA_VERSION,
 };
 use submitter::{
     build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
-    ModelSource, DEFAULT_API, DEFAULT_SHOWCASE_API,
+    ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -42,19 +42,20 @@ use verify::{run_verification, VerifyOpts};
 #[command(
     name = "llamabench",
     version,
-    about = "Benchmark your local LLM setup and publish the result.",
+    about = "Benchmark or evaluate an exact local-LLM configuration and publish the evidence.",
     after_help = "\
-Drop-in usage (just swap the program name in your existing command):
-  llamabench -m model.gguf -ngl 99 -fa on ...          # your llama-bench command
-  llamabench llama-server -m model.gguf -c 8192 ...    # your llama-server command
-  Extra llamabench flags work in both: --dry-run --no-verify --token <t>
-  --handle <@you> --family <fork> --llama-dir <bin> --api <url> --download-llama
+SPEED — runner options before `--`, then the native command:
+  llamabench speed -- llama-bench -m model.gguf -ngl 99 -fa on
+  llamabench speed -- llama-server -m model.gguf -c 8192
 
-Link a local GGUF to the Hugging Face repo it came from (hash-verified, remembered):
+EVAL — runner options before `--`, native llama-server arguments after it:
+  llamabench eval --model ./model.gguf --context-length 8192 -- \
+    -ctk q4_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2
+
+PROVENANCE:
   llamabench link ./model.gguf unsloth/gemma-4-12b-it-GGUF
 
-Run the optional, bounded ability showcase (not part of the speed benchmark):
-  llamabench showcase --model ./model.gguf --context-length 8192"
+Compatibility: bare drop-in commands and classic run/bench/verify remain available."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -67,14 +68,55 @@ enum Command {
     Auth(AuthArgs),
     /// Link a local GGUF to its Hugging Face repo (hash-verified, persistent).
     Link(LinkArgs),
+    /// Measure and submit one exact native llama-bench or llama-server command.
+    Speed(SpeedArgs),
     /// Run llama-bench and print the result (speed only).
+    #[command(hide = true)]
     Bench(RunArgs),
     /// Run the output-correctness verification against llama-server.
+    #[command(hide = true)]
     Verify(RunArgs),
     /// Full run: speed + verification → a complete ResultSubmission.
+    #[command(hide = true)]
     Run(RunArgs),
-    /// Run the opt-in visual, tool-use, and role-play ability showcase.
-    Showcase(ShowcaseArgs),
+    /// Evaluate one exact GGUF/runtime with fixed visual, tool-use, and role-play tasks.
+    Eval(EvalArgs),
+}
+
+#[derive(Args, Clone)]
+struct SpeedArgs {
+    /// Detect, print, and sign the result without submitting it.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the output-correctness pass.
+    #[arg(long)]
+    no_verify: bool,
+    /// Download the latest prebuilt upstream llama.cpp instead of using PATH.
+    #[arg(long)]
+    download_llama: bool,
+    /// CLI token from llamabench.ai/account — required to submit.
+    #[arg(long, env = "LLAMABENCH_TOKEN")]
+    token: Option<String>,
+    /// Submitter handle.
+    #[arg(long, default_value = "@anonymous")]
+    handle: String,
+    /// Which llama.cpp variant the build belongs to.
+    #[arg(long, value_enum, default_value = "llama.cpp")]
+    family: Family,
+    /// Directory containing llama-bench / llama-server.
+    #[arg(long, default_value = "")]
+    llama_dir: String,
+    /// Result-submission API endpoint.
+    #[arg(long, default_value = DEFAULT_API)]
+    api: String,
+    /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
+    #[arg(
+        last = true,
+        required = true,
+        num_args = 1..,
+        value_name = "LLAMA_COMMAND"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -186,7 +228,7 @@ struct RunArgs {
 }
 
 #[derive(Args, Clone)]
-struct ShowcaseArgs {
+struct EvalArgs {
     /// Directory containing llama-server. Default: search PATH, else auto-download
     /// a prebuilt CPU/Metal build (see --download-llama).
     #[arg(long, default_value = "")]
@@ -211,26 +253,32 @@ struct ShowcaseArgs {
     /// Submitter handle.
     #[arg(long, default_value = "@anonymous")]
     handle: String,
-    /// llama-server port used for the temporary showcase session.
+    /// llama-server port used for the temporary eval session.
     #[arg(long, default_value_t = 8080)]
     port: u16,
     /// API key used only for the temporary local llama-server session.
     #[arg(long, default_value = "llamabench")]
     api_key: String,
-    /// Context window for the showcase. The server-reported effective value is stored.
-    #[arg(long, default_value_t = 8192)]
+    /// Context window for the eval. The server-reported effective value is stored.
+    #[arg(
+        long,
+        default_value_t = 8192,
+        value_parser = clap::value_parser!(u32).range(1024..=1_048_576)
+    )]
     context_length: u32,
-    /// Extra arg passed verbatim to llama-server, repeatable.
-    #[arg(long = "server-arg", allow_hyphen_values = true)]
-    server_arg: Vec<String>,
-    /// Extra llama-server args as one whitespace-delimited string.
-    #[arg(long = "server-args", default_value = "", allow_hyphen_values = true)]
-    server_args: String,
+    /// Native llama-server arguments. Put them after `--`; every token is forwarded
+    /// in order and becomes part of the exact evaluation configuration.
+    #[arg(
+        last = true,
+        value_name = "LLAMA_SERVER_ARG",
+        allow_hyphen_values = true
+    )]
+    runtime_args: Vec<String>,
     /// Run and print the signed payload without submitting it.
     #[arg(long)]
     dry_run: bool,
-    /// Ability-showcase API endpoint.
-    #[arg(long, default_value = DEFAULT_SHOWCASE_API)]
+    /// Behavior-evaluation API endpoint.
+    #[arg(long, default_value = DEFAULT_EVAL_API)]
     api: String,
     /// CLI token from llamabench.ai/account — required to submit.
     #[arg(long, env = "LLAMABENCH_TOKEN")]
@@ -278,7 +326,7 @@ fn resolve_model(a: &RunArgs) -> Result<String> {
     resolve_model_parts(&a.model, &a.hf_model, a.quant.as_deref())
 }
 
-fn resolve_showcase_model(a: &ShowcaseArgs) -> Result<String> {
+fn resolve_eval_model(a: &EvalArgs) -> Result<String> {
     resolve_model_parts(&a.model, &a.hf_model, a.quant.as_deref())
 }
 
@@ -312,7 +360,7 @@ fn model_source<'a>(a: &'a RunArgs, model: &'a str) -> ModelSource<'a> {
     model_source_parts(&a.model, &a.hf_model, model)
 }
 
-fn showcase_model_source<'a>(a: &'a ShowcaseArgs, model: &'a str) -> ModelSource<'a> {
+fn eval_model_source<'a>(a: &'a EvalArgs, model: &'a str) -> ModelSource<'a> {
     model_source_parts(&a.model, &a.hf_model, model)
 }
 
@@ -371,76 +419,8 @@ fn classic_submission(
     build_submission(&ctx, b, v, hf)
 }
 
-fn showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
-    a.server_arg
-        .iter()
-        .cloned()
-        .chain(a.server_args.split_whitespace().map(String::from))
-        .collect()
-}
-
-const SHOWCASE_PATH_FLAGS: &[&str] = &[
-    "-md",
-    "--model-draft",
-    "--mmproj",
-    "--chat-template-file",
-    "--grammar-file",
-    "--lora",
-    "--lora-scaled",
-    "--control-vector",
-    "--control-vector-scaled",
-    "--lookup-cache-static",
-    "--lookup-cache-dynamic",
-    "--ssl-key-file",
-    "--ssl-cert-file",
-    "--log-file",
-    "--slot-save-path",
-];
-
-const SHOWCASE_SECRET_FLAGS: &[&str] = &["--api-key", "--api-key-file", "--hf-token"];
-
-fn redacted_showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
-    let args = showcase_server_args(a);
-    let mut redacted = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if let Some((flag, value)) = arg.split_once('=') {
-            if SHOWCASE_SECRET_FLAGS.contains(&flag) {
-                index += 1;
-                continue;
-            } else if SHOWCASE_PATH_FLAGS.contains(&flag) {
-                redacted.push(format!("{flag}={}", redact_showcase_path(value)));
-            } else {
-                redacted.push(arg.clone());
-            }
-        } else {
-            if SHOWCASE_SECRET_FLAGS.contains(&arg.as_str()) {
-                if args.get(index + 1).is_some() {
-                    index += 1;
-                }
-                index += 1;
-                continue;
-            }
-            redacted.push(arg.clone());
-            if SHOWCASE_PATH_FLAGS.contains(&arg.as_str()) {
-                if let Some(value) = args.get(index + 1) {
-                    redacted.push(redact_showcase_path(value));
-                    index += 1;
-                }
-            }
-        }
-        index += 1;
-    }
-    redacted
-}
-
-fn redact_showcase_path(value: &str) -> String {
-    let file = std::path::Path::new(value)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(value);
-    format!("./{file}")
+fn eval_server_args(a: &EvalArgs) -> Vec<String> {
+    a.runtime_args.clone()
 }
 
 fn shell_word(value: &str) -> String {
@@ -454,14 +434,14 @@ fn shell_word(value: &str) -> String {
     }
 }
 
-fn showcase_command(a: &ShowcaseArgs, model: &str, quant: &str) -> String {
+fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String]) -> String {
     let model_file = std::path::Path::new(model)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(model);
     let mut parts = vec![
         "llamabench".to_string(),
-        "showcase".to_string(),
+        "eval".to_string(),
         "--model".to_string(),
         shell_word(&format!("./{model_file}")),
         "--quant".to_string(),
@@ -472,21 +452,22 @@ fn showcase_command(a: &ShowcaseArgs, model: &str, quant: &str) -> String {
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
     }
-    for arg in redacted_showcase_server_args(a) {
-        parts.extend(["--server-arg".to_string(), shell_word(&arg)]);
+    if !runtime_args.is_empty() {
+        parts.push("--".to_string());
+        parts.extend(runtime_args.iter().map(|arg| shell_word(arg)));
     }
     parts.join(" ")
 }
 
-fn showcase_submission(
-    a: &ShowcaseArgs,
+fn eval_submission(
+    a: &EvalArgs,
     model_path: &str,
     quant: &str,
     gguf_sha256: String,
-    run: showcase::ShowcaseRun,
+    run: eval::EvaluationRun,
     hf: HfProvenance,
     backend: Backend,
-) -> AbilityShowcaseSubmission {
+) -> Result<EvaluationSubmission> {
     let HfProvenance {
         model: hf_model,
         verified: hf_verified,
@@ -497,6 +478,17 @@ fn showcase_submission(
         id: canonical_id,
         name: canonical_name,
     } = canonical;
+    let eval::EvaluationRun {
+        visuals,
+        agentic_tasks,
+        roleplay,
+        context_length,
+        runtime,
+    } = run;
+    let command = eval_command(a, model_path, quant, &runtime.args);
+    if command.chars().count() > 8_000 {
+        bail!("eval-v1 reproduce command exceeds 8000 characters");
+    }
     let fallback_name = submitter::model_name(model_path);
     let (model_id, name) = match (canonical_id, canonical_name) {
         (Some(id), Some(name)) => (id, name),
@@ -504,10 +496,10 @@ fn showcase_submission(
     };
     let params = submitter::params_from_name(&name);
 
-    AbilityShowcaseSubmission {
+    Ok(EvaluationSubmission {
         schema_version: SCHEMA_VERSION,
-        profile_version: ABILITY_SHOWCASE_PROFILE_VERSION.to_string(),
-        model: ShowcaseModel {
+        eval_version: EVAL_VERSION.to_string(),
+        model: EvaluationModel {
             id: model_id,
             name,
             params,
@@ -516,30 +508,45 @@ fn showcase_submission(
             hf_verified,
             gguf_sha256,
         },
-        config: ShowcaseConfig {
+        config: EvaluationConfig {
             quant: quant.to_string(),
-            context_length: run.context_length,
-            command: showcase_command(a, model_path, quant),
+            context_length,
+            kv_cache_key: runtime.kv_cache_key,
+            kv_cache_value: runtime.kv_cache_value,
+            flash_attention: runtime.flash_attention,
+            speculative_decoding: runtime.speculative_decoding,
+            command,
+            runtime_args: runtime.args,
         },
         backend,
-        settings: showcase::settings(),
-        visuals: run.visuals,
-        agentic_tasks: run.agentic_tasks,
-        roleplay: run.roleplay,
+        settings: eval::settings(),
+        visuals,
+        agentic_tasks,
+        roleplay,
         submitter: Submitter {
             handle: a.handle.clone(),
         },
         signature: String::new(),
-    }
+    })
 }
 
-fn ensure_showcase_hash_unchanged(before: &str, after: &str) -> Result<()> {
+fn ensure_eval_hash_unchanged(before: &str, after: &str) -> Result<()> {
     if before != after {
         bail!(
-            "model artifact changed while the ability showcase was running; refusing to submit evidence for ambiguous bytes"
+            "model artifact changed while the evaluation was running; refusing to submit ambiguous evidence"
         );
     }
     Ok(())
+}
+
+fn speed_mode(tool: &str) -> Result<dropin::Mode> {
+    match tool {
+        "llama-bench" => Ok(dropin::Mode::Bench),
+        "llama-server" => Ok(dropin::Mode::Server),
+        _ => bail!(
+            "speed expects `-- llama-bench <args>` or `-- llama-server <args>`; got {tool:?}. Use --llama-dir to select a build directory"
+        ),
+    }
 }
 
 fn main() -> Result<()> {
@@ -587,6 +594,25 @@ fn main() -> Result<()> {
                 (Some(path), None) => link::cmd_status(path)?,
                 (None, _) => link::cmd_list()?,
             }
+        }
+        Command::Speed(a) => {
+            let (tool, tool_args) = a.command.split_first().expect("required by clap");
+            let mode = speed_mode(tool)?;
+            eval::ensure_explicit_runtime_environment()?;
+            return dropin::run_with_options(
+                mode,
+                &dropin::WrapOpts {
+                    dry_run: a.dry_run,
+                    no_verify: a.no_verify,
+                    download_llama: a.download_llama,
+                    token: a.token,
+                    handle: a.handle,
+                    family: a.family,
+                    llama_dir: a.llama_dir,
+                    api: a.api,
+                },
+                tool_args,
+            );
         }
         Command::Bench(a) => {
             let model = resolve_model(&a)?;
@@ -638,14 +664,14 @@ fn main() -> Result<()> {
                 None => eprintln!("(dry run — not submitting)"),
             }
         }
-        Command::Showcase(a) => {
+        Command::Eval(a) => {
             let token = if a.dry_run {
                 None
             } else {
                 Some(submitter::resolve_token(a.token.as_deref())?)
             };
             eprintln!("\n▸ Model — resolve exact GGUF artifact");
-            let model = resolve_showcase_model(&a)?;
+            let model = resolve_eval_model(&a)?;
             let dir = submitter::resolve_llama_dir(
                 &a.llama_dir,
                 a.download_llama,
@@ -654,19 +680,19 @@ fn main() -> Result<()> {
             )?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let gguf_sha256 = link::fresh_sha256_for(&model)?;
-            let hf = provenance_exact(&showcase_model_source(&a, &model), &quant, &gguf_sha256);
-            let (backend_version, backend_hash) = showcase::server_version(&dir)?;
-            let run = showcase::run_showcase(&showcase::ShowcaseOpts {
+            let hf = provenance_exact(&eval_model_source(&a, &model), &quant, &gguf_sha256);
+            let (backend_version, backend_hash) = eval::server_version(&dir)?;
+            let run = eval::run_eval(&eval::EvaluationOpts {
                 server_bin_dir: &dir,
                 model: &model,
                 port: a.port,
                 api_key: &a.api_key,
                 context_length: a.context_length,
-                extra_server_args: showcase_server_args(&a),
+                runtime_args: eval_server_args(&a),
             })?;
             let final_gguf_sha256 = link::fresh_sha256_for(&model)?;
-            ensure_showcase_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
-            let mut submission = showcase_submission(
+            ensure_eval_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
+            let mut submission = eval_submission(
                 &a,
                 &model,
                 &quant,
@@ -678,11 +704,11 @@ fn main() -> Result<()> {
                     version: backend_version,
                     git_hash: backend_hash,
                 },
-            );
-            showcase::sign(&mut submission)?;
+            )?;
+            eval::sign(&mut submission)?;
             println!("{}", serde_json::to_string_pretty(&submission)?);
             match token {
-                Some(token) => submitter::submit_showcase(&a.api, &token, &submission)?,
+                Some(token) => submitter::submit_eval(&a.api, &token, &submission)?,
                 None => eprintln!("(dry run — not submitting)"),
             }
         }
@@ -745,6 +771,40 @@ mod tests {
     }
 
     #[test]
+    fn speed_cli_has_one_explicit_native_command_boundary() {
+        let cli = Cli::parse_from([
+            "llamabench",
+            "speed",
+            "--dry-run",
+            "--family",
+            "ik_llama.cpp",
+            "--",
+            "llama-server",
+            "-m",
+            "model.gguf",
+            "-c",
+            "8192",
+            "--chat-template",
+            "a template with spaces",
+        ]);
+        let Command::Speed(a) = cli.command else {
+            panic!("expected speed")
+        };
+        assert!(a.dry_run);
+        assert!(matches!(a.family, Family::IkLlamaCpp));
+        assert_eq!(a.command[0], "llama-server");
+        assert_eq!(
+            a.command.last().map(String::as_str),
+            Some("a template with spaces")
+        );
+        assert!(matches!(
+            speed_mode(&a.command[0]).unwrap(),
+            dropin::Mode::Server
+        ));
+        assert!(speed_mode("/tmp/llama-server").is_err());
+    }
+
+    #[test]
     fn classic_reproduce_command_redacts_path() {
         let cli = Cli::parse_from(["llamabench", "run", "--model", "/home/edu/x-Q4_K_M.gguf"]);
         let Command::Run(a) = cli.command else {
@@ -756,43 +816,66 @@ mod tests {
     }
 
     #[test]
-    fn showcase_cli_and_reproduce_command_are_bounded_and_redacted() {
+    fn eval_cli_preserves_native_argument_boundaries() {
         let cli = Cli::parse_from([
             "llamabench",
-            "showcase",
+            "eval",
             "--model",
             "/home/edu/model-Q4_K_M.gguf",
-            "--server-arg",
-            "--flash-attn",
-            "--server-arg",
-            "--ssl-cert-file",
-            "--server-arg",
-            "/home/alice/cert.pem",
-            "--server-arg",
-            "--hf-token",
-            "--server-arg",
-            "super-secret",
-            "--server-arg",
-            "--hf-token=also-secret",
+            "--",
+            "-ctk",
+            "q4_0",
+            "-ctv",
+            "q4_0",
+            "--chat-template",
+            "a template with spaces",
+            "--spec-type",
+            "draft-mtp",
+            "--spec-draft-n-max",
+            "2",
         ]);
-        let Command::Showcase(a) = cli.command else {
-            panic!("expected showcase")
+        let Command::Eval(a) = cli.command else {
+            panic!("expected eval")
         };
         assert_eq!(a.context_length, 8192);
-        let command = showcase_command(&a, "/home/edu/model-Q4_K_M.gguf", "Q4_K_M");
-        assert!(command.contains("showcase --model ./model-Q4_K_M.gguf"));
-        assert!(command.contains("--server-arg --flash-attn"));
+        assert_eq!(a.runtime_args[5], "a template with spaces");
+        let runtime = eval::runtime_config(&a.runtime_args).unwrap();
+        let command = eval_command(&a, "/home/edu/model-Q4_K_M.gguf", "Q4_K_M", &runtime.args);
+        assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
+        assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
+        assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));
-        assert!(command.contains("--server-arg --ssl-cert-file --server-arg ./cert.pem"));
-        assert!(!command.contains("/home/alice"));
-        assert!(!command.contains("hf-token"));
-        assert!(!command.contains("super-secret"));
-        assert!(!command.contains("also-secret"));
+        assert_eq!(runtime.kv_cache_key, "q4_0");
+        assert_eq!(runtime.kv_cache_value, "q4_0");
+        assert_eq!(runtime.speculative_decoding.mode, "draft-mtp");
+        assert_eq!(
+            runtime.speculative_decoding.parameters,
+            vec!["--spec-draft-n-max=2"]
+        );
+
+        assert!(Cli::try_parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--server-args",
+            "-ctk q4_0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--context-length",
+            "512",
+        ])
+        .is_err());
     }
 
     #[test]
-    fn showcase_submission_requires_stable_artifact_bytes() {
-        assert!(ensure_showcase_hash_unchanged("abc", "abc").is_ok());
-        assert!(ensure_showcase_hash_unchanged("abc", "def").is_err());
+    fn eval_submission_requires_stable_artifact_bytes() {
+        assert!(ensure_eval_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_eval_hash_unchanged("abc", "def").is_err());
     }
 }

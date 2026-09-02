@@ -18,7 +18,7 @@ use crate::download;
 use crate::link;
 
 pub const DEFAULT_API: &str = "https://llamabench.ai/api/results";
-pub const DEFAULT_SHOWCASE_API: &str = "https://llamabench.ai/api/showcases";
+pub const DEFAULT_EVAL_API: &str = "https://llamabench.ai/api/evals";
 
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
@@ -162,7 +162,7 @@ pub fn provenance(source: &ModelSource, quant: &str) -> HfProvenance {
 
 /// Provenance for an artifact whose current bytes have already been freshly
 /// hashed. This avoids trusting a size-only download cache or a size+mtime link
-/// cache when an exact-artifact showcase is attributed.
+/// cache when an exact-artifact evaluation is attributed.
 pub fn provenance_exact(source: &ModelSource, quant: &str, sha256: &str) -> HfProvenance {
     match source {
         ModelSource::Downloaded(repo) | ModelSource::LocalWithRepo(_, repo) => HfProvenance {
@@ -444,15 +444,15 @@ pub fn submit(api: &str, token: &str, s: &ResultSubmission) -> Result<()> {
     Ok(())
 }
 
-pub fn submit_showcase(api: &str, token: &str, s: &AbilityShowcaseSubmission) -> Result<()> {
+pub fn submit_eval(api: &str, token: &str, s: &EvaluationSubmission) -> Result<()> {
     let resp = ureq::post(api)
         .set("Authorization", &format!("Bearer {token}"))
         .send_json(s)
-        .map_err(|e| anyhow::anyhow!("showcase submit failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("evaluation submit failed: {e}"))?;
     let body: serde_json::Value = resp.into_json()?;
     match body.get("url").and_then(serde_json::Value::as_str) {
-        Some(url) => eprintln!("✓ Submitted ability showcase: {url}"),
-        None => eprintln!("✓ submitted ability showcase: {body}"),
+        Some(url) => eprintln!("✓ Submitted evaluation: {url}"),
+        None => eprintln!("✓ submitted evaluation: {body}"),
     }
     Ok(())
 }

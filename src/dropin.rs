@@ -66,14 +66,20 @@ impl Default for WrapOpts {
 
 pub fn run(mode: Mode, args: &[String]) -> Result<()> {
     let (w, tool_args) = extract_wrapper_flags(args)?;
+    run_with_options(mode, &w, &tool_args)
+}
+
+/// Explicit command path used by `llamabench speed`: Clap owns runner options and
+/// the native argument vector is already separated by `--` (ADR-015).
+pub fn run_with_options(mode: Mode, options: &WrapOpts, tool_args: &[String]) -> Result<()> {
     let mode = if mode == Mode::Auto {
-        sniff_mode(&tool_args)
+        sniff_mode(tool_args)
     } else {
         mode
     };
     match mode {
-        Mode::Server => run_server(&w, &tool_args),
-        _ => run_bench(&w, &tool_args),
+        Mode::Server => run_server(options, tool_args),
+        _ => run_bench(options, tool_args),
     }
 }
 

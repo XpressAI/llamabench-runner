@@ -45,7 +45,7 @@ fn file_sha256_progress(path: &Path, total: u64) -> Result<String> {
 }
 
 /// Hash a local model from its current bytes, deliberately bypassing the
-/// size+mtime cache. Exact-artifact showcases use this stronger identity rule
+/// size+mtime cache. Exact-artifact evals use this stronger identity rule
 /// because a same-size replacement can preserve a coarse filesystem timestamp.
 pub fn fresh_sha256_for(model: &str) -> Result<String> {
     let key = key_for(model)?;
