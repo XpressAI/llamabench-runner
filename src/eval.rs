@@ -303,7 +303,11 @@ fn speculative_mode(args: &[String]) -> String {
 fn runtime_environment_conflicts(names: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut conflicts = names
         .into_iter()
-        .filter(|name| name.starts_with("LLAMA_ARG_"))
+        .filter(|name| {
+            name.as_bytes()
+                .get(.."LLAMA_ARG_".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"LLAMA_ARG_"))
+        })
         .collect::<Vec<_>>();
     conflicts.sort();
     conflicts
@@ -1393,10 +1397,14 @@ mod tests {
                 "PATH".to_string(),
                 "LLAMA_ARG_FLASH_ATTN".to_string(),
                 "LLAMA_ARG_CACHE_TYPE_K".to_string(),
+                "llama_arg_cache_type_v".to_string(),
+                "LlAmA_ArG_DrAfT".to_string(),
             ]),
             vec![
                 "LLAMA_ARG_CACHE_TYPE_K".to_string(),
                 "LLAMA_ARG_FLASH_ATTN".to_string(),
+                "LlAmA_ArG_DrAfT".to_string(),
+                "llama_arg_cache_type_v".to_string(),
             ]
         );
     }
