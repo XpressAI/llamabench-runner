@@ -103,6 +103,31 @@ llamabench verify --model /path/to/model.gguf
 llamabench run --model /path/to/model.gguf --dry-run
 ```
 
+### Optional ability showcase
+
+`showcase` is a separate, opt-in profile for comparing what an exact GGUF can
+do, not another speed measurement and not part of `run`:
+
+```sh
+llamabench showcase --model /path/to/model-Q4_K_M.gguf \
+  --llama-dir /path/to/llama.cpp/build/bin --context-length 8192
+```
+
+The versioned profile starts `llama-server` once and runs five bounded
+scenarios: a pelican-on-a-bicycle SVG, a self-contained Breakout game, two
+deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
+role-play. It uses temperature 0, seed 42, and at most 2,848 generated tokens in
+total. At 1 tok/s that is under 48 minutes; faster models finish proportionally
+sooner. Use `--dry-run` to inspect the complete signed JSON without submitting.
+
+Every showcase is tied to the GGUF's SHA-256, exact quant, effective context,
+backend build, prompt/profile version, generated-token counts, and durations.
+The site reports separate inspectable outcomes rather than an aggregate
+"intelligence" score. The runner's virtual tools never touch the real
+filesystem: they operate only on fixed in-memory fixtures. Generated SVG is
+rasterized by the server before display, and generated HTML is never executed
+by llamabench.ai.
+
 ### Getting the model and llama.cpp
 
 - **`--hf-model <repo> --quant <Q>`** downloads a GGUF straight from Hugging Face

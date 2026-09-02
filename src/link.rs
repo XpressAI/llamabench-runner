@@ -44,6 +44,16 @@ fn file_sha256_progress(path: &Path, total: u64) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// Hash a local model from its current bytes, deliberately bypassing the
+/// size+mtime cache. Exact-artifact showcases use this stronger identity rule
+/// because a same-size replacement can preserve a coarse filesystem timestamp.
+pub fn fresh_sha256_for(model: &str) -> Result<String> {
+    let key = key_for(model)?;
+    let (size, _) = file_meta(&key)?;
+    eprintln!("  hashing {} for exact-artifact identity…", short(model));
+    file_sha256_progress(Path::new(&key), size)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -281,6 +291,54 @@ pub fn resolve(model: &str) -> Option<Resolved> {
     Some(Resolved { repo, verified })
 }
 
+/// Resolve a stored link against a hash already computed from the current file
+/// bytes. Exact-artifact callers use this instead of the size+mtime shortcut.
+pub fn resolve_with_sha256(model: &str, sha256: &str) -> Option<Resolved> {
+    let key = key_for(model).ok()?;
+    let entry = config::links().get(&key).cloned()?;
+    let Ok((size, mtime)) = file_meta(&key) else {
+        return None;
+    };
+    if entry.sha256.eq_ignore_ascii_case(sha256) {
+        eprintln!(
+            "→ provenance: {} (linked, {})",
+            entry.repo,
+            if entry.verified {
+                "hash-verified"
+            } else {
+                "NOT verified"
+            }
+        );
+        return Some(Resolved {
+            repo: entry.repo,
+            verified: entry.verified,
+        });
+    }
+
+    eprintln!(
+        "↻ {} bytes differ from its stored link — re-verifying against {}",
+        short(&key),
+        entry.repo
+    );
+    let matched = download::hf_file_by_sha256(&entry.repo, sha256)
+        .ok()
+        .flatten();
+    let verified = matched.is_some();
+    let repo = entry.repo.clone();
+    let _ = config::upsert_link(
+        &key,
+        LinkEntry {
+            repo: entry.repo,
+            file: matched.unwrap_or_default(),
+            sha256: sha256.to_string(),
+            size,
+            mtime,
+            verified,
+        },
+    );
+    Some(Resolved { repo, verified })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,9 +350,14 @@ mod tests {
         path.push(format!("llamabench_sha256_{}.bin", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         let got = file_sha256(&path);
+        let fresh = fresh_sha256_for(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             got.unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            fresh.unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }

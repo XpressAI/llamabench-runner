@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -68,7 +69,7 @@ pub struct VerifySession<'a> {
 }
 
 /// Kills the spawned server on drop so we never leak a process.
-struct ServerGuard(Child);
+pub(crate) struct ServerGuard(Child);
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -87,7 +88,8 @@ fn session_of<'a>(opts: &'a VerifyOpts) -> VerifySession<'a> {
     }
 }
 
-fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
+pub(crate) fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
+    ensure_port_available(opts.port)?;
     let bin = Path::new(opts.server_bin_dir).join("llama-server");
     let port = opts.port.to_string();
     let mut cmd = Command::new(&bin);
@@ -106,10 +108,46 @@ fn spawn_server(opts: &VerifyOpts) -> Result<ServerGuard> {
     let child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    let guard = ServerGuard(child);
-    wait_until_ready(opts.port, Some(opts.api_key), Duration::from_secs(240))
-        .context("llama-server did not become ready")?;
+    let mut guard = ServerGuard(child);
+    wait_until_ready_for_child(
+        &mut guard.0,
+        opts.port,
+        Some(opts.api_key),
+        Duration::from_secs(240),
+    )
+    .context("llama-server did not become ready")?;
     Ok(guard)
+}
+
+fn ensure_port_available(port: u16) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+        format!("port {port} is already in use; stop the existing server or choose --port <PORT>")
+    })?;
+    drop(listener);
+    Ok(())
+}
+
+fn wait_until_ready_for_child(
+    child: &mut Child,
+    port: u16,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<()> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(status) = child.try_wait().context("checking llama-server process")? {
+            bail!("spawned llama-server exited before readiness ({status})");
+        }
+        if health_is_ready(&url, api_key) {
+            if let Some(status) = child.try_wait().context("checking llama-server process")? {
+                bail!("spawned llama-server exited during readiness ({status})");
+            }
+            return Ok(());
+        }
+        sleep(Duration::from_secs(2));
+    }
+    bail!("timed out after {:?}", timeout)
 }
 
 pub fn run_verification(opts: &VerifyOpts) -> Result<Verification> {
@@ -333,17 +371,20 @@ pub fn wait_until_ready(port: u16, api_key: Option<&str>, timeout: Duration) -> 
     let url = format!("http://127.0.0.1:{port}/health");
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let mut req = ureq::get(&url).timeout(Duration::from_secs(5));
-        if let Some(key) = api_key {
-            req = req.set("Authorization", &format!("Bearer {key}"));
-        }
-        let ok = req.call().map(|r| r.status() == 200).unwrap_or(false);
-        if ok {
+        if health_is_ready(&url, api_key) {
             return Ok(());
         }
         sleep(Duration::from_secs(2));
     }
     bail!("timed out after {:?}", timeout)
+}
+
+fn health_is_ready(url: &str, api_key: Option<&str>) -> bool {
+    let mut req = ureq::get(url).timeout(Duration::from_secs(5));
+    if let Some(key) = api_key {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+    req.call().map(|r| r.status() == 200).unwrap_or(false)
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -399,6 +440,17 @@ pub fn is_gibberish(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_a_port_owned_by_another_process() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = ensure_port_available(port).unwrap_err().to_string();
+        assert!(error.contains("already in use"));
+
+        drop(listener);
+        ensure_port_available(port).unwrap();
+    }
 
     #[test]
     fn accepts_coherent_text() {

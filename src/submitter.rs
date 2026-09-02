@@ -18,6 +18,7 @@ use crate::download;
 use crate::link;
 
 pub const DEFAULT_API: &str = "https://llamabench.ai/api/results";
+pub const DEFAULT_SHOWCASE_API: &str = "https://llamabench.ai/api/showcases";
 
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
@@ -159,6 +160,27 @@ pub fn provenance(source: &ModelSource, quant: &str) -> HfProvenance {
     }
 }
 
+/// Provenance for an artifact whose current bytes have already been freshly
+/// hashed. This avoids trusting a size-only download cache or a size+mtime link
+/// cache when an exact-artifact showcase is attributed.
+pub fn provenance_exact(source: &ModelSource, quant: &str, sha256: &str) -> HfProvenance {
+    match source {
+        ModelSource::Downloaded(repo) | ModelSource::LocalWithRepo(_, repo) => HfProvenance {
+            model: Some(repo.to_string()),
+            verified: Some(verify_hf_sha256(repo, quant, sha256)),
+            canonical: resolve_canonical(repo),
+        },
+        ModelSource::LocalOnly(model) => match link::resolve_with_sha256(model, sha256) {
+            Some(link) => HfProvenance {
+                model: Some(link.repo.clone()),
+                verified: Some(link.verified),
+                canonical: resolve_canonical(&link.repo),
+            },
+            None => HfProvenance::none(),
+        },
+    }
+}
+
 /// Verify a local GGUF against the HF repo it claims to be, by SHA-256. HF publishes
 /// each LFS file's sha256 as its `lfs.oid` (tree API), so we stream-hash the local
 /// file and compare — no re-download. Network/resolution failures are non-fatal: they
@@ -173,13 +195,17 @@ fn verify_hf_hash(model: &str, repo: &str, quant: &str) -> bool {
             return false;
         }
     };
+    verify_hf_sha256(repo, quant, &local)
+}
+
+fn verify_hf_sha256(repo: &str, quant: &str, local: &str) -> bool {
     match download::hf_expected_sha256(repo, quant) {
         Ok(Some(expected)) if local.eq_ignore_ascii_case(&expected) => {
             eprintln!("✓ HF hash verified: matches {repo}");
             true
         }
         Ok(Some(_)) => {
-            eprintln!("⚠ HF hash MISMATCH: local file differs from {repo} ({model})");
+            eprintln!("⚠ HF hash MISMATCH: exact artifact differs from {repo}");
             false
         }
         Ok(None) => {
@@ -257,8 +283,10 @@ pub fn params_from_name(name: &str) -> f64 {
                 .filter(|rest| !rest.is_empty())
                 .and_then(|rest| rest.parse::<f64>().ok())
         })
-        .next_back()
-        .unwrap_or(0.0)
+        // MoE names often include both total and active sizes (35B-A3B). The
+        // catalog's `params` is total parameters, so the largest B-valued token
+        // is the least-wrong filename-only fallback.
+        .fold(0.0, f64::max)
 }
 
 /// Everything the caller (classic or drop-in) decides about a submission; the
@@ -416,6 +444,19 @@ pub fn submit(api: &str, token: &str, s: &ResultSubmission) -> Result<()> {
     Ok(())
 }
 
+pub fn submit_showcase(api: &str, token: &str, s: &AbilityShowcaseSubmission) -> Result<()> {
+    let resp = ureq::post(api)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(s)
+        .map_err(|e| anyhow::anyhow!("showcase submit failed: {e}"))?;
+    let body: serde_json::Value = resp.into_json()?;
+    match body.get("url").and_then(serde_json::Value::as_str) {
+        Some(url) => eprintln!("✓ Submitted ability showcase: {url}"),
+        None => eprintln!("✓ submitted ability showcase: {body}"),
+    }
+    Ok(())
+}
+
 /// Token resolution order: explicit flag → LLAMABENCH_TOKEN env → saved config file.
 /// (The classic path lets clap fold the env var into the flag; the drop-in path calls
 /// this with just the extracted flag, so the env var is checked here too.)
@@ -552,6 +593,7 @@ mod tests {
         assert_eq!(params_from_name("gemma-4-12b-it-UD-Q4_K_XL"), 12.0);
         assert_eq!(params_from_name("Llama-3.2-1B-Instruct-Q4_K_M"), 1.0);
         assert_eq!(params_from_name("Qwen3.5-0.6B"), 0.6);
+        assert_eq!(params_from_name("Ornith-1.0-35B-A3B"), 35.0);
         // "3.1" (version) must not be read as a size; "8B" wins.
         assert_eq!(params_from_name("Meta-Llama-3.1-8B"), 8.0);
         assert_eq!(params_from_name("mystery-model"), 0.0);

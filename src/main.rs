@@ -20,6 +20,7 @@ mod detect;
 mod download;
 mod dropin;
 mod link;
+mod showcase;
 mod submitter;
 mod verify;
 
@@ -27,10 +28,13 @@ use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 
 use bench::{run_llama_bench, BenchOpts, BenchResult};
-use contract::Verification;
+use contract::{
+    AbilityShowcaseSubmission, Backend, ShowcaseConfig, ShowcaseModel, Submitter, Verification,
+    ABILITY_SHOWCASE_PROFILE_VERSION, SCHEMA_VERSION,
+};
 use submitter::{
-    build_submission, provenance, resolved_quant, BuildCtx, Family, HfProvenance, ModelSource,
-    DEFAULT_API,
+    build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
+    ModelSource, DEFAULT_API, DEFAULT_SHOWCASE_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -47,7 +51,10 @@ Drop-in usage (just swap the program name in your existing command):
   --handle <@you> --family <fork> --llama-dir <bin> --api <url> --download-llama
 
 Link a local GGUF to the Hugging Face repo it came from (hash-verified, remembered):
-  llamabench link ./model.gguf unsloth/gemma-4-12b-it-GGUF"
+  llamabench link ./model.gguf unsloth/gemma-4-12b-it-GGUF
+
+Run the optional, bounded ability showcase (not part of the speed benchmark):
+  llamabench showcase --model ./model.gguf --context-length 8192"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,6 +73,8 @@ enum Command {
     Verify(RunArgs),
     /// Full run: speed + verification → a complete ResultSubmission.
     Run(RunArgs),
+    /// Run the opt-in visual, tool-use, and role-play ability showcase.
+    Showcase(ShowcaseArgs),
 }
 
 #[derive(Args)]
@@ -176,6 +185,58 @@ struct RunArgs {
     token: Option<String>,
 }
 
+#[derive(Args, Clone)]
+struct ShowcaseArgs {
+    /// Directory containing llama-server. Default: search PATH, else auto-download
+    /// a prebuilt CPU/Metal build (see --download-llama).
+    #[arg(long, default_value = "")]
+    llama_dir: String,
+    /// Download the latest prebuilt upstream llama.cpp instead of using PATH.
+    #[arg(long)]
+    download_llama: bool,
+    /// Which llama.cpp variant the build is.
+    #[arg(long, value_enum, default_value = "llama.cpp")]
+    family: Family,
+    /// Path to the exact local GGUF to exercise.
+    #[arg(long)]
+    model: Option<String>,
+    /// Optional Hugging Face GGUF repo for provenance. Without --model, downloads
+    /// the selected --quant; with --model, verifies the local bytes against it.
+    #[arg(long)]
+    hf_model: Option<String>,
+    /// Quantization selector/fallback, e.g. Q4_K_M. The GGUF filename remains
+    /// authoritative when it contains a quant.
+    #[arg(long)]
+    quant: Option<String>,
+    /// Submitter handle.
+    #[arg(long, default_value = "@anonymous")]
+    handle: String,
+    /// llama-server port used for the temporary showcase session.
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+    /// API key used only for the temporary local llama-server session.
+    #[arg(long, default_value = "llamabench")]
+    api_key: String,
+    /// Context window for the showcase. The server-reported effective value is stored.
+    #[arg(long, default_value_t = 8192)]
+    context_length: u32,
+    /// Extra arg passed verbatim to llama-server, repeatable.
+    #[arg(long = "server-arg", allow_hyphen_values = true)]
+    server_arg: Vec<String>,
+    /// Extra llama-server args as one whitespace-delimited string.
+    #[arg(long = "server-args", default_value = "", allow_hyphen_values = true)]
+    server_args: String,
+    /// Run and print the signed payload without submitting it.
+    #[arg(long)]
+    dry_run: bool,
+    /// Ability-showcase API endpoint.
+    #[arg(long, default_value = DEFAULT_SHOWCASE_API)]
+    api: String,
+    /// CLI token from llamabench.ai/account — required to submit.
+    #[arg(long, env = "LLAMABENCH_TOKEN")]
+    token: Option<String>,
+}
+
 fn bench_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> BenchOpts<'a> {
     BenchOpts {
         llama_bin_dir: llama_dir,
@@ -214,7 +275,19 @@ fn verify_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> Verify
 /// `--hf-model` is also given it only attributes provenance. With `--hf-model`
 /// alone, download the `--quant` GGUF from the repo. At least one must be given.
 fn resolve_model(a: &RunArgs) -> Result<String> {
-    match (&a.model, &a.hf_model) {
+    resolve_model_parts(&a.model, &a.hf_model, a.quant.as_deref())
+}
+
+fn resolve_showcase_model(a: &ShowcaseArgs) -> Result<String> {
+    resolve_model_parts(&a.model, &a.hf_model, a.quant.as_deref())
+}
+
+fn resolve_model_parts(
+    model: &Option<String>,
+    hf_model: &Option<String>,
+    quant: Option<&str>,
+) -> Result<String> {
+    match (model, hf_model) {
         (None, None) => bail!(
             "no model: pass --model <path.gguf>, or --hf-model <repo> --quant <Q> \
              (e.g. --hf-model bartowski/Llama-3.1-8B-Instruct-GGUF --quant Q4_K_M)"
@@ -223,15 +296,9 @@ fn resolve_model(a: &RunArgs) -> Result<String> {
         // recorded/verified as provenance, not downloaded.
         (Some(m), _) => Ok(m.clone()),
         (None, Some(repo)) => {
-            let quant = a
-                .quant
-                .as_deref()
-                .filter(|q| !q.trim().is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--hf-model requires --quant <Q> to pick the .gguf (e.g. Q4_K_M)"
-                    )
-                })?;
+            let quant = quant.filter(|q| !q.trim().is_empty()).ok_or_else(|| {
+                anyhow::anyhow!("--hf-model requires --quant <Q> to pick the .gguf (e.g. Q4_K_M)")
+            })?;
             Ok(download::hf_download(repo, quant)?
                 .to_string_lossy()
                 .into_owned())
@@ -242,10 +309,22 @@ fn resolve_model(a: &RunArgs) -> Result<String> {
 /// The provenance source for a classic run: an explicit `--hf-model` wins; a bare
 /// `--model` consults the persistent link store (ADR-009).
 fn model_source<'a>(a: &'a RunArgs, model: &'a str) -> ModelSource<'a> {
-    match (&a.model, &a.hf_model) {
+    model_source_parts(&a.model, &a.hf_model, model)
+}
+
+fn showcase_model_source<'a>(a: &'a ShowcaseArgs, model: &'a str) -> ModelSource<'a> {
+    model_source_parts(&a.model, &a.hf_model, model)
+}
+
+fn model_source_parts<'a>(
+    requested_model: &'a Option<String>,
+    hf_model: &'a Option<String>,
+    resolved_model: &'a str,
+) -> ModelSource<'a> {
+    match (requested_model, hf_model) {
         (Some(m), Some(repo)) => ModelSource::LocalWithRepo(m, repo),
         (None, Some(repo)) => ModelSource::Downloaded(repo),
-        _ => ModelSource::LocalOnly(model),
+        _ => ModelSource::LocalOnly(resolved_model),
     }
 }
 
@@ -290,6 +369,177 @@ fn classic_submission(
     let mut ctx = classic_ctx(a, model, quant);
     ctx.ttft_ms = ttft_ms;
     build_submission(&ctx, b, v, hf)
+}
+
+fn showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
+    a.server_arg
+        .iter()
+        .cloned()
+        .chain(a.server_args.split_whitespace().map(String::from))
+        .collect()
+}
+
+const SHOWCASE_PATH_FLAGS: &[&str] = &[
+    "-md",
+    "--model-draft",
+    "--mmproj",
+    "--chat-template-file",
+    "--grammar-file",
+    "--lora",
+    "--lora-scaled",
+    "--control-vector",
+    "--control-vector-scaled",
+    "--lookup-cache-static",
+    "--lookup-cache-dynamic",
+    "--ssl-key-file",
+    "--ssl-cert-file",
+    "--log-file",
+    "--slot-save-path",
+];
+
+const SHOWCASE_SECRET_FLAGS: &[&str] = &["--api-key", "--api-key-file", "--hf-token"];
+
+fn redacted_showcase_server_args(a: &ShowcaseArgs) -> Vec<String> {
+    let args = showcase_server_args(a);
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some((flag, value)) = arg.split_once('=') {
+            if SHOWCASE_SECRET_FLAGS.contains(&flag) {
+                index += 1;
+                continue;
+            } else if SHOWCASE_PATH_FLAGS.contains(&flag) {
+                redacted.push(format!("{flag}={}", redact_showcase_path(value)));
+            } else {
+                redacted.push(arg.clone());
+            }
+        } else {
+            if SHOWCASE_SECRET_FLAGS.contains(&arg.as_str()) {
+                if args.get(index + 1).is_some() {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            redacted.push(arg.clone());
+            if SHOWCASE_PATH_FLAGS.contains(&arg.as_str()) {
+                if let Some(value) = args.get(index + 1) {
+                    redacted.push(redact_showcase_path(value));
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+    redacted
+}
+
+fn redact_showcase_path(value: &str) -> String {
+    let file = std::path::Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value);
+    format!("./{file}")
+}
+
+fn shell_word(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-._/:=".contains(c))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn showcase_command(a: &ShowcaseArgs, model: &str, quant: &str) -> String {
+    let model_file = std::path::Path::new(model)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model);
+    let mut parts = vec![
+        "llamabench".to_string(),
+        "showcase".to_string(),
+        "--model".to_string(),
+        shell_word(&format!("./{model_file}")),
+        "--quant".to_string(),
+        shell_word(quant),
+        "--context-length".to_string(),
+        a.context_length.to_string(),
+    ];
+    if a.family != Family::LlamaCpp {
+        parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
+    }
+    for arg in redacted_showcase_server_args(a) {
+        parts.extend(["--server-arg".to_string(), shell_word(&arg)]);
+    }
+    parts.join(" ")
+}
+
+fn showcase_submission(
+    a: &ShowcaseArgs,
+    model_path: &str,
+    quant: &str,
+    gguf_sha256: String,
+    run: showcase::ShowcaseRun,
+    hf: HfProvenance,
+    backend: Backend,
+) -> AbilityShowcaseSubmission {
+    let HfProvenance {
+        model: hf_model,
+        verified: hf_verified,
+        canonical,
+    } = hf;
+    let submitter::Canonical {
+        base_model,
+        id: canonical_id,
+        name: canonical_name,
+    } = canonical;
+    let fallback_name = submitter::model_name(model_path);
+    let (model_id, name) = match (canonical_id, canonical_name) {
+        (Some(id), Some(name)) => (id, name),
+        _ => (detect::slugify(&fallback_name), fallback_name),
+    };
+    let params = submitter::params_from_name(&name);
+
+    AbilityShowcaseSubmission {
+        schema_version: SCHEMA_VERSION,
+        profile_version: ABILITY_SHOWCASE_PROFILE_VERSION.to_string(),
+        model: ShowcaseModel {
+            id: model_id,
+            name,
+            params,
+            base_model,
+            hf_model,
+            hf_verified,
+            gguf_sha256,
+        },
+        config: ShowcaseConfig {
+            quant: quant.to_string(),
+            context_length: run.context_length,
+            command: showcase_command(a, model_path, quant),
+        },
+        backend,
+        settings: showcase::settings(),
+        visuals: run.visuals,
+        agentic_tasks: run.agentic_tasks,
+        roleplay: run.roleplay,
+        submitter: Submitter {
+            handle: a.handle.clone(),
+        },
+        signature: String::new(),
+    }
+}
+
+fn ensure_showcase_hash_unchanged(before: &str, after: &str) -> Result<()> {
+    if before != after {
+        bail!(
+            "model artifact changed while the ability showcase was running; refusing to submit evidence for ambiguous bytes"
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -388,6 +638,54 @@ fn main() -> Result<()> {
                 None => eprintln!("(dry run — not submitting)"),
             }
         }
+        Command::Showcase(a) => {
+            let token = if a.dry_run {
+                None
+            } else {
+                Some(submitter::resolve_token(a.token.as_deref())?)
+            };
+            eprintln!("\n▸ Model — resolve exact GGUF artifact");
+            let model = resolve_showcase_model(&a)?;
+            let dir = submitter::resolve_llama_dir(
+                &a.llama_dir,
+                a.download_llama,
+                a.family,
+                &["llama-server"],
+            )?;
+            let quant = resolved_quant(a.quant.as_deref(), &model);
+            let gguf_sha256 = link::fresh_sha256_for(&model)?;
+            let hf = provenance_exact(&showcase_model_source(&a, &model), &quant, &gguf_sha256);
+            let (backend_version, backend_hash) = showcase::server_version(&dir)?;
+            let run = showcase::run_showcase(&showcase::ShowcaseOpts {
+                server_bin_dir: &dir,
+                model: &model,
+                port: a.port,
+                api_key: &a.api_key,
+                context_length: a.context_length,
+                extra_server_args: showcase_server_args(&a),
+            })?;
+            let final_gguf_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_showcase_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
+            let mut submission = showcase_submission(
+                &a,
+                &model,
+                &quant,
+                gguf_sha256,
+                run,
+                hf,
+                Backend {
+                    name: a.family.backend_name().to_string(),
+                    version: backend_version,
+                    git_hash: backend_hash,
+                },
+            );
+            showcase::sign(&mut submission)?;
+            println!("{}", serde_json::to_string_pretty(&submission)?);
+            match token {
+                Some(token) => submitter::submit_showcase(&a.api, &token, &submission)?,
+                None => eprintln!("(dry run — not submitting)"),
+            }
+        }
     }
     Ok(())
 }
@@ -455,5 +753,46 @@ mod tests {
         let ctx = classic_ctx(&a, "/home/edu/x-Q4_K_M.gguf", "Q4_K_M");
         assert!(ctx.command.starts_with("llama-bench -m ./x-Q4_K_M.gguf"));
         assert!(!ctx.command.contains("/home/edu"));
+    }
+
+    #[test]
+    fn showcase_cli_and_reproduce_command_are_bounded_and_redacted() {
+        let cli = Cli::parse_from([
+            "llamabench",
+            "showcase",
+            "--model",
+            "/home/edu/model-Q4_K_M.gguf",
+            "--server-arg",
+            "--flash-attn",
+            "--server-arg",
+            "--ssl-cert-file",
+            "--server-arg",
+            "/home/alice/cert.pem",
+            "--server-arg",
+            "--hf-token",
+            "--server-arg",
+            "super-secret",
+            "--server-arg",
+            "--hf-token=also-secret",
+        ]);
+        let Command::Showcase(a) = cli.command else {
+            panic!("expected showcase")
+        };
+        assert_eq!(a.context_length, 8192);
+        let command = showcase_command(&a, "/home/edu/model-Q4_K_M.gguf", "Q4_K_M");
+        assert!(command.contains("showcase --model ./model-Q4_K_M.gguf"));
+        assert!(command.contains("--server-arg --flash-attn"));
+        assert!(!command.contains("/home/edu"));
+        assert!(command.contains("--server-arg --ssl-cert-file --server-arg ./cert.pem"));
+        assert!(!command.contains("/home/alice"));
+        assert!(!command.contains("hf-token"));
+        assert!(!command.contains("super-secret"));
+        assert!(!command.contains("also-secret"));
+    }
+
+    #[test]
+    fn showcase_submission_requires_stable_artifact_bytes() {
+        assert!(ensure_showcase_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_showcase_hash_unchanged("abc", "def").is_err());
     }
 }
