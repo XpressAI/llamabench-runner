@@ -1,0 +1,1 @@
+Thinking: Windows environment names are case-insensitive even though Rust strings are not. Comparing the ASCII prefix on bytes avoids allocations and avoids slicing through a non-ASCII code point; diagnostics still show the exact names users need to unset.
