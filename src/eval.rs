@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Opt-in exact-artifact ability showcase (ADR-014).
+//! Opt-in exact-configuration behavior evaluation (ADR-014).
 //!
 //! Starts the user's existing llama-server once, then runs two inspectable visual
 //! prompts, two deterministic virtual-tool tasks, and a three-turn public-domain
@@ -14,8 +14,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::contract::{
-    AbilityShowcaseSubmission, AgenticTaskResult, RoleplayResult, RoleplayTurn, ShowcaseCheck,
-    ShowcaseSettings, ShowcaseVisuals, ToolCallRecord, VisualArtifact,
+    AgenticTaskResult, EvaluationCheck, EvaluationSettings, EvaluationSubmission,
+    EvaluationVisuals, RoleplayResult, RoleplayTurn, SpeculativeDecodingConfig, ToolCallRecord,
+    VisualArtifact,
 };
 use crate::verify::{self, VerifyOpts};
 
@@ -33,44 +34,80 @@ const CONTROLLED_SERVER_FLAGS: &[&str] = &[
     "--model",
     "-mu",
     "--model-url",
+    "-dr",
+    "--docker-repo",
     "-hf",
     "-hfr",
     "--hf-repo",
     "-hff",
     "--hf-file",
+    "-hft",
+    "--hf-token",
     "--host",
     "--port",
     "--api-key",
     "--api-key-file",
+    "-c",
+    "--ctx-size",
+    "--ssl-key-file",
+    "--ssl-cert-file",
+    "--log-file",
+    "--log-prompts-dir",
+    "--slot-save-path",
 ];
 const UNTRACKED_ARTIFACT_FLAGS: &[&str] = &[
     "-md",
     "--model-draft",
+    "--spec-draft-model",
+    "--spec-draft-hf",
+    "-hfd",
+    "-hfrd",
+    "--hf-repo-draft",
+    "-mm",
     "--mmproj",
+    "-mmu",
+    "--mmproj-url",
     "--chat-template-file",
     "--grammar-file",
+    "-jf",
+    "--json-schema-file",
     "--lora",
     "--lora-scaled",
     "--control-vector",
     "--control-vector-scaled",
+    "-lcs",
     "--lookup-cache-static",
+    "-lcd",
     "--lookup-cache-dynamic",
 ];
+const SPEC_PARAMETER_SHORT_FLAGS: &[&str] = &[
+    "-ctkd", "-ctvd", "-td", "-tbd", "-Cd", "-Crd", "-Cbd", "-otd", "-cmoed", "-ncmoed", "-devd",
+    "-ngld", "-cd",
+];
 
-pub struct ShowcaseOpts<'a> {
+pub struct EvaluationOpts<'a> {
     pub server_bin_dir: &'a str,
     pub model: &'a str,
     pub port: u16,
     pub api_key: &'a str,
     pub context_length: u32,
-    pub extra_server_args: Vec<String>,
+    pub runtime_args: Vec<String>,
 }
 
-pub struct ShowcaseRun {
-    pub visuals: ShowcaseVisuals,
+pub struct RuntimeConfig {
+    pub args: Vec<String>,
+    pub kv_cache_key: String,
+    pub kv_cache_value: String,
+    pub flash_attention: String,
+    pub speculative_decoding: SpeculativeDecodingConfig,
+}
+
+pub struct EvaluationRun {
+    pub visuals: EvaluationVisuals,
     pub agentic_tasks: Vec<AgenticTaskResult>,
     pub roleplay: RoleplayResult,
     pub context_length: u32,
+    pub runtime: RuntimeConfig,
 }
 
 struct ChatReply {
@@ -97,8 +134,8 @@ struct RequestedTool {
     arguments: String,
 }
 
-pub fn settings() -> ShowcaseSettings {
-    ShowcaseSettings {
+pub fn settings() -> EvaluationSettings {
+    EvaluationSettings {
         seed: SEED,
         temperature: 0.0,
         visual_max_tokens: VISUAL_MAX_TOKENS,
@@ -107,10 +144,11 @@ pub fn settings() -> ShowcaseSettings {
     }
 }
 
-pub fn run_showcase(opts: &ShowcaseOpts) -> Result<ShowcaseRun> {
-    validate_extra_server_args(&opts.extra_server_args)?;
+pub fn run_eval(opts: &EvaluationOpts) -> Result<EvaluationRun> {
+    ensure_explicit_runtime_environment()?;
+    let runtime = runtime_config(&opts.runtime_args)?;
     let mut server_args = vec!["-c".to_string(), opts.context_length.to_string()];
-    server_args.extend(opts.extra_server_args.clone());
+    server_args.extend(opts.runtime_args.clone());
     let verify_opts = VerifyOpts {
         server_bin_dir: opts.server_bin_dir,
         model: opts.model,
@@ -160,36 +198,205 @@ pub fn run_showcase(opts: &ShowcaseOpts) -> Result<ShowcaseRun> {
     eprintln!("\n▸ [5/5] Role-play — Phileas Fogg, three turns");
     let roleplay = run_roleplay(opts)?;
 
-    Ok(ShowcaseRun {
-        visuals: ShowcaseVisuals {
+    Ok(EvaluationRun {
+        visuals: EvaluationVisuals {
             pelican_svg,
             breakout_html,
         },
         agentic_tasks: vec![discovery, repair],
         roleplay,
         context_length,
+        runtime,
     })
 }
 
-fn validate_extra_server_args(args: &[String]) -> Result<()> {
-    for arg in args {
-        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-        if CONTROLLED_SERVER_FLAGS.contains(&flag) {
-            bail!(
-                "{flag} is controlled by `llamabench showcase`; use the corresponding showcase option instead"
-            );
+fn runtime_flag(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(flag, _)| flag)
+}
+
+fn follows_flag(value: Option<&String>) -> bool {
+    value.is_some_and(|value| !value.starts_with('-') || value.parse::<f64>().is_ok())
+}
+
+fn last_runtime_value(args: &[String], names: &[&str]) -> Option<String> {
+    let mut value = None;
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        if let Some((flag, inline)) = token.split_once('=') {
+            if names.contains(&flag) {
+                value = Some(inline.to_string());
+            }
+        } else if names.contains(&token.as_str()) {
+            if follows_flag(args.get(index + 1)) {
+                index += 1;
+                value = Some(args[index].clone());
+            } else {
+                value = Some(String::new());
+            }
         }
-        if UNTRACKED_ARTIFACT_FLAGS.contains(&flag) {
-            bail!(
-                "{flag} supplies an auxiliary artifact that is not represented in ability-showcase-v1 provenance"
-            );
+        index += 1;
+    }
+    value
+}
+
+fn canonical_runtime_flags(args: &[String], predicate: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        let flag = runtime_flag(token);
+        if predicate(flag) {
+            if token.contains('=') {
+                values.push(token.clone());
+            } else if follows_flag(args.get(index + 1)) {
+                index += 1;
+                values.push(format!("{token}={}", args[index]));
+            } else {
+                values.push(token.clone());
+            }
         }
+        index += 1;
+    }
+    values
+}
+
+fn is_model_preset_flag(flag: &str) -> bool {
+    (flag.ends_with("-default") && flag != "--spec-default")
+        || (flag.starts_with("--fim-") && flag.ends_with("-spec"))
+}
+
+fn is_spec_parameter_flag(flag: &str) -> bool {
+    ((flag.starts_with("--spec-") || flag.starts_with("--no-spec-"))
+        && !matches!(flag, "--spec-type" | "--spec-default"))
+        || flag.starts_with("--draft")
+        || flag.ends_with("-draft")
+        || SPEC_PARAMETER_SHORT_FLAGS.contains(&flag)
+}
+
+fn speculative_mode(args: &[String]) -> String {
+    let mut mode = "none".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        let flag = runtime_flag(token);
+        if flag == "--spec-default" {
+            mode = "default".to_string();
+        } else if flag == "--spec-type" {
+            if let Some((_, inline)) = token.split_once('=') {
+                if !inline.is_empty() {
+                    mode = inline.to_string();
+                }
+            } else if follows_flag(args.get(index + 1)) {
+                index += 1;
+                mode = args[index].clone();
+            }
+        }
+        index += 1;
+    }
+    mode
+}
+
+/// llama.cpp accepts most native options through `LLAMA_ARG_*` environment
+/// variables. Inheriting one would make the published argument vector incomplete,
+/// so exact-config commands fail fast and ask for an explicit native flag instead.
+fn runtime_environment_conflicts(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut conflicts = names
+        .into_iter()
+        .filter(|name| name.starts_with("LLAMA_ARG_"))
+        .collect::<Vec<_>>();
+    conflicts.sort();
+    conflicts
+}
+
+pub fn ensure_explicit_runtime_environment() -> Result<()> {
+    let conflicts = runtime_environment_conflicts(
+        std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+    );
+    if !conflicts.is_empty() {
+        bail!(
+            "exact-config commands cannot inherit llama.cpp runtime settings from {}; unset them and pass the equivalent native flags after `--`",
+            conflicts.join(", ")
+        );
     }
     Ok(())
 }
 
+fn looks_like_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    Path::new(value).is_absolute()
+        || value.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn exact_runtime_args(args: &[String]) -> Result<Vec<String>> {
+    for arg in args {
+        let value = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
+        if looks_like_absolute_path(value) {
+            bail!(
+                "eval-v1 cannot publish absolute native argument value {value:?} without losing exact identity; use a relative value or remove that option"
+            );
+        }
+    }
+    Ok(args.to_vec())
+}
+
+pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
+    if args.len() > 256 {
+        bail!("eval-v1 accepts at most 256 native arguments");
+    }
+    for arg in args {
+        let length = arg.chars().count();
+        if length == 0 || length > 2_000 {
+            bail!("each eval-v1 native argument must contain 1..=2000 characters");
+        }
+        let flag = runtime_flag(arg);
+        if CONTROLLED_SERVER_FLAGS.contains(&flag) || is_model_preset_flag(flag) {
+            bail!(
+                "{flag} is controlled by `llamabench eval`; put model, context, and transport settings before `--`"
+            );
+        }
+        if UNTRACKED_ARTIFACT_FLAGS.contains(&flag) {
+            bail!("{flag} supplies an auxiliary artifact that eval-v1 cannot hash and represent");
+        }
+    }
+    let kv_cache_key = last_runtime_value(args, &["-ctk", "--cache-type-k"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "f16".to_string());
+    let kv_cache_value = last_runtime_value(args, &["-ctv", "--cache-type-v"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| kv_cache_key.clone());
+    let flash_attention = match last_runtime_value(args, &["-fa", "--flash-attn"])
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("auto") => "auto",
+        Some("" | "on" | "1" | "true" | "enabled") => "on",
+        Some("off" | "0" | "false" | "disabled") => "off",
+        Some(value) => bail!("unsupported flash-attention value {value:?}"),
+    }
+    .to_string();
+    let mode = speculative_mode(args);
+    let exact_args = exact_runtime_args(args)?;
+    let parameters = canonical_runtime_flags(&exact_args, is_spec_parameter_flag);
+    if parameters.len() > 64 || parameters.iter().any(|value| value.chars().count() > 500) {
+        bail!("eval-v1 accepts at most 64 speculative overrides of at most 500 characters each");
+    }
+    Ok(RuntimeConfig {
+        args: exact_args,
+        kv_cache_key,
+        kv_cache_value,
+        flash_attention,
+        speculative_decoding: SpeculativeDecodingConfig { mode, parameters },
+    })
+}
+
 fn run_visual(
-    opts: &ShowcaseOpts,
+    opts: &EvaluationOpts,
     prompt_id: &str,
     system: &str,
     prompt: &str,
@@ -223,7 +430,7 @@ fn run_visual(
 }
 
 fn chat(
-    opts: &ShowcaseOpts,
+    opts: &EvaluationOpts,
     messages: &[Value],
     tools: Option<&Value>,
     max_tokens: u32,
@@ -244,13 +451,11 @@ fn chat(
         .timeout(Duration::from_secs(1_500))
         .set("Authorization", &format!("Bearer {}", opts.api_key))
         .send_json(body)
-        .map_err(|e| anyhow::anyhow!("showcase chat request failed: {e}"))?;
-    let v: Value = resp
-        .into_json()
-        .context("decoding showcase chat response")?;
+        .map_err(|e| anyhow::anyhow!("eval chat request failed: {e}"))?;
+    let v: Value = resp.into_json().context("decoding eval chat response")?;
     let message = v["choices"][0]["message"].clone();
     if !message.is_object() {
-        bail!("showcase response carried no assistant message");
+        bail!("eval response carried no assistant message");
     }
     let content = message["content"].as_str().unwrap_or_default().to_string();
     let reasoning = message["reasoning_content"]
@@ -278,7 +483,7 @@ trait AgentHarness {
 }
 
 fn run_agent_task<H: AgentHarness>(
-    opts: &ShowcaseOpts,
+    opts: &EvaluationOpts,
     mut harness: H,
 ) -> Result<AgenticTaskResult> {
     let start = Instant::now();
@@ -544,7 +749,7 @@ impl AgentHarness for RepairHarness {
     }
 }
 
-fn run_roleplay(opts: &ShowcaseOpts) -> Result<RoleplayResult> {
+fn run_roleplay(opts: &EvaluationOpts) -> Result<RoleplayResult> {
     let start = Instant::now();
     let mut messages = vec![json!({
         "role": "system",
@@ -618,7 +823,7 @@ fn json_string_arg(arguments: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn breakout_checks(output: &str) -> Vec<ShowcaseCheck> {
+fn breakout_checks(output: &str) -> Vec<EvaluationCheck> {
     let lower = output.to_ascii_lowercase();
     vec![
         check(
@@ -646,7 +851,7 @@ fn breakout_checks(output: &str) -> Vec<ShowcaseCheck> {
     ]
 }
 
-fn roleplay_checks(question_id: &str, answer: &str) -> Vec<ShowcaseCheck> {
+fn roleplay_checks(question_id: &str, answer: &str) -> Vec<EvaluationCheck> {
     let lower = answer.to_ascii_lowercase();
     let no_assistant_break = !contains_any(
         &lower,
@@ -787,8 +992,8 @@ fn denies_moon_landing(answer: &str) -> bool {
         )
 }
 
-fn check(id: &str, label: &str, passed: bool) -> ShowcaseCheck {
-    ShowcaseCheck {
+fn check(id: &str, label: &str, passed: bool) -> EvaluationCheck {
+    EvaluationCheck {
         id: id.to_string(),
         label: label.to_string(),
         passed,
@@ -840,7 +1045,7 @@ pub fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn sign(s: &mut AbilityShowcaseSubmission) -> Result<()> {
+pub fn sign(s: &mut EvaluationSubmission) -> Result<()> {
     s.signature.clear();
     s.signature = sha256_hex(&serde_json::to_string(s)?);
     Ok(())
@@ -858,7 +1063,7 @@ pub fn server_version(dir: &str) -> Result<(String, String)> {
         }
     }
     bail!(
-        "could not determine an exact backend build from {} --version; refusing to publish ambiguous showcase evidence",
+        "could not determine an exact backend build from {} --version; refusing to publish ambiguous eval evidence",
         bin.display()
     )
 }
@@ -1091,34 +1296,108 @@ mod tests {
     }
 
     #[test]
-    fn extra_server_args_cannot_override_showcase_identity_or_transport() {
-        for flag in ["-m", "--model=/tmp/other.gguf", "--hf-repo", "--port=9090"] {
-            assert!(validate_extra_server_args(&[flag.to_string()]).is_err());
+    fn runtime_args_cannot_override_eval_identity_or_transport() {
+        for flag in [
+            "-m",
+            "--model=/tmp/other.gguf",
+            "--model-url",
+            "--docker-repo=ai/gemma3",
+            "--hf-repo",
+            "--hf-token=secret",
+            "-c",
+            "--port=9090",
+            "--gpt-oss-20b-default",
+        ] {
+            assert!(runtime_config(&[flag.to_string()]).is_err());
         }
-        validate_extra_server_args(&[
-            "--flash-attn".to_string(),
+        let runtime = runtime_config(&[
+            "-ctk".to_string(),
+            "q4_0".to_string(),
+            "-ctv=q8_0".to_string(),
+            "--flash-attn=off".to_string(),
             "--spec-type".to_string(),
             "draft-mtp".to_string(),
+            "--spec-draft-n-max".to_string(),
+            "2".to_string(),
         ])
         .unwrap();
+        assert_eq!(runtime.kv_cache_key, "q4_0");
+        assert_eq!(runtime.kv_cache_value, "q8_0");
+        assert_eq!(runtime.flash_attention, "off");
+        assert_eq!(runtime.speculative_decoding.mode, "draft-mtp");
+        assert_eq!(
+            runtime.speculative_decoding.parameters,
+            vec!["--spec-draft-n-max=2"]
+        );
+        assert_eq!(runtime.args.last().map(String::as_str), Some("2"));
+
+        let default_spec = runtime_config(&[
+            "--spec-default".to_string(),
+            "-ngld".to_string(),
+            "99".to_string(),
+            "--draft-p-min=0.2".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(default_spec.speculative_decoding.mode, "default");
+        assert_eq!(
+            default_spec.speculative_decoding.parameters,
+            vec!["-ngld=99", "--draft-p-min=0.2"]
+        );
+
+        for value in [
+            "/home/alice/private.txt",
+            "C:\\Users\\Alice\\private.txt",
+            "\\\\server\\share\\private.txt",
+        ] {
+            assert!(runtime_config(&[format!("--future-option={value}")]).is_err());
+        }
     }
 
     #[test]
-    fn extra_server_args_reject_untracked_behavior_artifacts() {
+    fn runtime_args_reject_untracked_behavior_artifacts() {
         for flag in [
             "-md",
             "--model-draft=/tmp/draft.gguf",
+            "--spec-draft-model=/tmp/draft.gguf",
+            "--hf-repo-draft=org/draft",
+            "-mm",
             "--mmproj",
+            "--mmproj-url=https://example.invalid/mmproj.gguf",
             "--chat-template-file=/tmp/template.jinja",
             "--grammar-file",
+            "--json-schema-file=/tmp/schema.json",
             "--lora=/tmp/adapter.gguf",
             "--lora-scaled",
             "--control-vector=/tmp/vector.gguf",
             "--control-vector-scaled",
+            "-lcs",
             "--lookup-cache-static=/tmp/cache.bin",
             "--lookup-cache-dynamic",
         ] {
-            assert!(validate_extra_server_args(&[flag.to_string()]).is_err());
+            assert!(runtime_config(&[flag.to_string()]).is_err());
         }
+    }
+
+    #[test]
+    fn runtime_args_enforce_wire_bounds_before_running() {
+        assert!(runtime_config(&vec!["--verbose".to_string(); 257]).is_err());
+        assert!(runtime_config(&[String::new()]).is_err());
+        assert!(runtime_config(&[format!("--chat-template={}", "x".repeat(2_001))]).is_err());
+        assert!(runtime_config(&[format!("--spec-custom={}", "x".repeat(501))]).is_err());
+    }
+
+    #[test]
+    fn exact_commands_detect_inherited_llama_runtime_settings_without_values() {
+        assert_eq!(
+            runtime_environment_conflicts([
+                "PATH".to_string(),
+                "LLAMA_ARG_FLASH_ATTN".to_string(),
+                "LLAMA_ARG_CACHE_TYPE_K".to_string(),
+            ]),
+            vec![
+                "LLAMA_ARG_CACHE_TYPE_K".to_string(),
+                "LLAMA_ARG_FLASH_ATTN".to_string(),
+            ]
+        );
     }
 }

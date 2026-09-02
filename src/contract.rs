@@ -141,13 +141,13 @@ pub struct Submitter {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in exact-artifact ability showcase (ADR-014).
+// Opt-in exact-configuration behavior evaluation (ADR-014).
 // ---------------------------------------------------------------------------
 
-pub const ABILITY_SHOWCASE_PROFILE_VERSION: &str = "ability-showcase-v1";
+pub const EVAL_VERSION: &str = "eval-v1";
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShowcaseSettings {
+pub struct EvaluationSettings {
     pub seed: u64,
     pub temperature: f64,
     #[serde(rename = "visualMaxTokens")]
@@ -159,7 +159,7 @@ pub struct ShowcaseSettings {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShowcaseCheck {
+pub struct EvaluationCheck {
     pub id: String,
     pub label: String,
     pub passed: bool,
@@ -177,11 +177,11 @@ pub struct VisualArtifact {
     #[serde(rename = "generatedTokens")]
     pub generated_tokens: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<ShowcaseCheck>,
+    pub checks: Vec<EvaluationCheck>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShowcaseVisuals {
+pub struct EvaluationVisuals {
     #[serde(rename = "pelicanSvg")]
     pub pelican_svg: VisualArtifact,
     #[serde(rename = "breakoutHtml")]
@@ -222,7 +222,7 @@ pub struct RoleplayTurn {
     pub answer_sha256: String,
     #[serde(rename = "generatedTokens")]
     pub generated_tokens: u32,
-    pub checks: Vec<ShowcaseCheck>,
+    pub checks: Vec<EvaluationCheck>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -236,7 +236,7 @@ pub struct RoleplayResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShowcaseModel {
+pub struct EvaluationModel {
     pub id: String,
     pub name: String,
     pub params: f64,
@@ -251,24 +251,40 @@ pub struct ShowcaseModel {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShowcaseConfig {
+pub struct EvaluationConfig {
     pub quant: String,
     #[serde(rename = "contextLength")]
     pub context_length: u32,
+    #[serde(rename = "kvCacheKey")]
+    pub kv_cache_key: String,
+    #[serde(rename = "kvCacheValue")]
+    pub kv_cache_value: String,
+    #[serde(rename = "flashAttention")]
+    pub flash_attention: String,
+    #[serde(rename = "speculativeDecoding")]
+    pub speculative_decoding: SpeculativeDecodingConfig,
+    #[serde(rename = "runtimeArgs")]
+    pub runtime_args: Vec<String>,
     pub command: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AbilityShowcaseSubmission {
+pub struct SpeculativeDecodingConfig {
+    pub mode: String,
+    pub parameters: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvaluationSubmission {
     #[serde(rename = "schemaVersion")]
     pub schema_version: u32,
-    #[serde(rename = "profileVersion")]
-    pub profile_version: String,
-    pub model: ShowcaseModel,
-    pub config: ShowcaseConfig,
+    #[serde(rename = "evalVersion")]
+    pub eval_version: String,
+    pub model: EvaluationModel,
+    pub config: EvaluationConfig,
     pub backend: Backend,
-    pub settings: ShowcaseSettings,
-    pub visuals: ShowcaseVisuals,
+    pub settings: EvaluationSettings,
+    pub visuals: EvaluationVisuals,
     #[serde(rename = "agenticTasks")]
     pub agentic_tasks: Vec<AgenticTaskResult>,
     pub roleplay: RoleplayResult,
@@ -343,5 +359,34 @@ mod tests {
         };
         let json = serde_json::to_value(&turn).unwrap();
         assert_eq!(json["generatedTokens"], 12);
+    }
+
+    #[test]
+    fn evaluation_config_serializes_exact_runtime_identity() {
+        let config = EvaluationConfig {
+            quant: "Q4_K_M".to_string(),
+            context_length: 8192,
+            kv_cache_key: "q4_0".to_string(),
+            kv_cache_value: "q4_0".to_string(),
+            flash_attention: "auto".to_string(),
+            speculative_decoding: SpeculativeDecodingConfig {
+                mode: "draft-mtp".to_string(),
+                parameters: vec!["--spec-draft-n-max=2".to_string()],
+            },
+            runtime_args: vec![
+                "-ctk".to_string(),
+                "q4_0".to_string(),
+                "--spec-type".to_string(),
+                "draft-mtp".to_string(),
+            ],
+            command: "llamabench eval --model ./model.gguf -- -ctk q4_0".to_string(),
+        };
+        let json = serde_json::to_value(config).unwrap();
+        assert_eq!(json["contextLength"], 8192);
+        assert_eq!(json["kvCacheKey"], "q4_0");
+        assert_eq!(json["kvCacheValue"], "q4_0");
+        assert_eq!(json["flashAttention"], "auto");
+        assert_eq!(json["speculativeDecoding"]["mode"], "draft-mtp");
+        assert_eq!(json["runtimeArgs"][0], "-ctk");
     }
 }

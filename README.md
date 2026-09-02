@@ -21,33 +21,41 @@ from the [Releases page](../../releases) and drop the binary somewhere on your P
 
 Supported prebuilt targets: Linux x86_64, macOS (Intel + Apple Silicon), Windows x86_64.
 
-## Usage — drop in for llama-bench / llama-server
+## Usage — run the exact native command
 
-Take the command you already run and swap the program name. Your **exact
-configuration** is benchmarked, verified, recorded verbatim as the reproduce
-command, and submitted:
+Put runner-owned options before `--` and the complete native command after it.
+Your **exact configuration** is benchmarked, verified, recorded verbatim as the
+reproduce command, and submitted:
 
 ```sh
 # 1. Save your token once (get one at https://llamabench.ai/account).
 llamabench auth <token>
 
-# 2a. You run llama-bench? Drop the dash:
-#       llama-bench -m model.gguf -ngl 99 -fa on -ub 2048 -ot "ffn=CPU"
-llamabench -m model.gguf -ngl 99 -fa on -ub 2048 -ot "ffn=CPU"
+# 2a. Benchmark your llama-bench configuration:
+llamabench speed -- \
+  llama-bench -m model.gguf -ngl 99 -fa on -ub 2048 -ot "ffn=CPU"
 
-# 2b. You run llama-server? Prefix it:
-#       llama-server -m model.gguf -c 8192 -np 2 --jinja
-llamabench llama-server -m model.gguf -c 8192 -np 2 --jinja
+# 2b. Or benchmark your llama-server configuration:
+llamabench speed -- \
+  llama-server -m model.gguf -c 8192 -np 2 --jinja
 ```
 
 Every flag is passed through to the real tool untouched (matrix runs like
-`-ngl 0,99` submit one result per configuration). llamabench adds its own flags
-on top — they never collide with llama.cpp's: `--dry-run` (don't submit),
+`-ngl 0,99` submit one result per configuration). Runner flags live before
+`--`, so they cannot collide with llama.cpp's: `--dry-run` (don't submit),
 `--no-verify` (skip the output-correctness pass), `--token <t>`,
 `--handle <@you>`, `--family <fork>`, `--llama-dir <bin-dir>`, `--api <url>`,
-`--download-llama`. Bare `llamabench <flags>` picks the tool automatically
-(server-only flags like `--port`/`-c` ⇒ llama-server); force it with
-`llamabench llama-bench …` or `llamabench llama-server …`.
+`--download-llama`.
+
+The explicit `speed` and `eval` workflows refuse inherited `LLAMA_ARG_*`
+settings because an environment-only option would be missing from the published
+config. Unset it and put the equivalent native flag after `--`.
+
+The v0.4.x drop-in forms remain compatible: bare `llamabench <flags>` selects
+llama-bench unless it sees server-only flags, while explicit
+`llamabench llama-bench …` and `llamabench llama-server …` force the tool. New
+scripts should prefer `speed -- <native command>` because the ownership boundary
+is visible and does not depend on flag sniffing.
 
 In llama-bench mode the speed table you know streams as usual and the numbers
 are read from llama-bench's own per-test output (`-oe jsonl` is appended); TTFT
@@ -75,10 +83,11 @@ llamabench link --list            # show all links
 llamabench link --forget <path>   # remove one
 ```
 
-### Classic subcommands
+### Compatibility subcommands
 
-The original flag-based interface still works (and is what the submit page
-generates):
+The original flag-based `run`/`bench`/`verify` interface remains available for
+v0.4.x scripts and the download-with-no-local-setup flow. New commands do not
+copy this partial llama.cpp flag surface:
 
 ```sh
 # Fetch the model from Hugging Face AND a prebuilt llama.cpp — no local setup:
@@ -103,30 +112,45 @@ llamabench verify --model /path/to/model.gguf
 llamabench run --model /path/to/model.gguf --dry-run
 ```
 
-### Optional ability showcase
+### Exact-config behavior evaluation
 
-`showcase` is a separate, opt-in profile for comparing what an exact GGUF can
-do, not another speed measurement and not part of `run`:
+`eval` is a separate, opt-in fixed evaluation, not another speed measurement
+and not part of `run`. Runner-owned options go before `--`; every token after
+`--` is passed to `llama-server` in order and becomes part of the recorded
+runtime configuration:
 
 ```sh
-llamabench showcase --model /path/to/model-Q4_K_M.gguf \
-  --llama-dir /path/to/llama.cpp/build/bin --context-length 8192
+llamabench eval --model /path/to/model-Q4_K_M.gguf \
+  --llama-dir /path/to/llama.cpp/build/bin --context-length 8192 -- \
+  -ngl 99 -ctk q4_0 -ctv q4_0 -fa auto \
+  --spec-type draft-mtp --spec-draft-n-max 2
 ```
 
-The versioned profile starts `llama-server` once and runs five bounded
+There is no `--server-arg` repetition and no whitespace-split `--server-args`
+string in `eval`; normal shell quoting determines the native argument vector.
+
+The versioned evaluation starts `llama-server` once and runs five bounded
 scenarios: a pelican-on-a-bicycle SVG, a self-contained Breakout game, two
 deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
 role-play. It uses temperature 0, seed 42, and at most 2,848 generated tokens in
 total. At 1 tok/s that is under 48 minutes; faster models finish proportionally
 sooner. Use `--dry-run` to inspect the complete signed JSON without submitting.
 
-Every showcase is tied to the GGUF's SHA-256, exact quant, effective context,
-backend build, prompt/profile version, generated-token counts, and durations.
+Every evaluation is tied to the GGUF SHA-256, backend build, effective context,
+KV-cache K/V types, flash-attention mode, speculative-decoding settings, and the
+ordered byte-for-byte native argument vector. The server derives a configuration
+fingerprint from those structured values, so Q4 KV-cache evidence never stands
+in for Q8/F16 and speculative decoding never stands in for ordinary decoding.
+External draft models, LoRAs, grammars, projectors, control vectors, and template
+files are rejected in `eval-v1` until the contract can hash every auxiliary
+artifact. Absolute native path values also fail closed rather than being shortened
+into a potentially colliding config. Built-in speculative decoding and its tuning
+flags are supported.
+
 The site reports separate inspectable outcomes rather than an aggregate
-"intelligence" score. The runner's virtual tools never touch the real
-filesystem: they operate only on fixed in-memory fixtures. Generated SVG is
-rasterized by the server before display, and generated HTML is never executed
-by llamabench.ai.
+"intelligence" score. The runner's virtual tools never touch the real filesystem:
+they operate only on fixed in-memory fixtures. Generated SVG is rasterized by the
+server before display, and generated HTML is never executed by llamabench.ai.
 
 ### Getting the model and llama.cpp
 
@@ -162,22 +186,22 @@ by llamabench.ai.
 
 ### Token resolution
 
-`run` resolves the submission token in this order: `--token` flag →
+Submission commands resolve the token in this order: `--token` flag →
 `LLAMABENCH_TOKEN` env var → the token saved by `llamabench auth`. If none is found
 (and you're not using `--dry-run`), it errors and points you at `llamabench auth`.
 
 Common flags (see `--help` for the full list): `--ngl`, `--fa`, `--ctk`/`--ctv` (KV cache type),
 `--n-prompt`/`--n-gen`, `--spec-decode`, `--seed`, `--turns`, `--reps`.
 
-Pass extra flags straight through to `llama-server` (handy for the many speculative-decoding
-options) with either:
+The compatibility `run` command still accepts its historical pass-through forms:
 
-- **`--server-args "<flags>"`** — one whitespace-delimited string, e.g.
-  `--server-args "--spec-type draft-mtp --spec-draft-n-max 2"`. Easiest for a bunch at once.
+- **`--server-args "<flags>"`** — one whitespace-delimited string.
 - **`--server-arg <value>`** — repeatable, one value each
   (`--server-arg --foo --server-arg "two words"`). Use it when a value contains spaces.
 
 Both are appended (repeatable `--server-arg` first, then the split `--server-args`).
+Prefer the native argument vector after `--` in new commands; it preserves quoted
+values exactly.
 
 ## Build from source
 
