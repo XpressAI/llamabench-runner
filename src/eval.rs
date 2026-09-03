@@ -155,7 +155,7 @@ fn evaluation_server_args(
     runtime_args: &[String],
 ) -> Result<Vec<String>> {
     if context_length.is_none() && runtime_conflicts_with_auto_fit(runtime_args) {
-        bail!("automatic context selection requires unambiguous llama.cpp parameter fitting; use an enabled `--fit=VALUE` form or pass an explicit --context-length");
+        bail!("automatic context selection requires unambiguous llama.cpp parameter fitting; use an enabled `-fit=VALUE` or `--fit=VALUE` form, or pass an explicit --context-length");
     }
     let mut server_args = Vec::new();
     if let Some(context_length) = context_length {
@@ -260,14 +260,15 @@ fn last_runtime_value(args: &[String], names: &[&str]) -> Option<String> {
 
 fn runtime_conflicts_with_auto_fit(args: &[String]) -> bool {
     args.iter().any(|arg| {
-        if arg == "--fit" || runtime_flag(arg) == "--no-fit" {
+        if matches!(arg.as_str(), "-fit" | "--fit") || runtime_flag(arg) == "--no-fit" {
             return true;
         }
-        arg.strip_prefix("--fit=").is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "off" | "0" | "false" | "disabled"
-            )
+        arg.split_once('=').is_some_and(|(flag, value)| {
+            matches!(flag, "-fit" | "--fit")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "disabled"
+                )
         })
     })
 }
@@ -1392,6 +1393,9 @@ mod tests {
             vec!["-c", "262144", "-ngl", "999"]
         );
         for disabled in [
+            vec!["-fit".to_string(), "off".to_string()],
+            vec!["-fit=0".to_string()],
+            vec!["-fit=FALSE".to_string()],
             vec!["--fit".to_string(), "off".to_string()],
             vec!["--fit=0".to_string()],
             vec!["--fit=FALSE".to_string()],
@@ -1400,11 +1404,16 @@ mod tests {
             assert!(evaluation_server_args(None, &disabled).is_err());
             assert!(evaluation_server_args(Some(8192), &disabled).is_ok());
         }
-        assert!(evaluation_server_args(None, &["--fit".to_string(), "on".to_string()]).is_err());
-        assert_eq!(
-            evaluation_server_args(None, &["--fit=on".to_string()]).unwrap(),
-            vec!["--fit=on"]
-        );
+        for spelling in ["-fit", "--fit"] {
+            assert!(
+                evaluation_server_args(None, &[spelling.to_string(), "on".to_string()]).is_err()
+            );
+            let inline = format!("{spelling}=on");
+            assert_eq!(
+                evaluation_server_args(None, std::slice::from_ref(&inline)).unwrap(),
+                vec![inline]
+            );
+        }
     }
 
     #[test]
