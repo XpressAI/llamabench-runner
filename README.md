@@ -121,10 +121,17 @@ runtime configuration:
 
 ```sh
 llamabench eval --model /path/to/model-Q4_K_M.gguf \
-  --llama-dir /path/to/llama.cpp/build/bin --context-length 8192 -- \
+  --llama-dir /path/to/llama.cpp/build/bin -- \
   -ngl 99 -ctk q4_0 -ctv q4_0 -fa auto \
   --spec-type draft-mtp --spec-draft-n-max 2
 ```
+
+By default the runner does not pass `-c`: llama.cpp starts from the model-native
+context and fits the largest effective context it can to the available hardware.
+The runner records the positive value reported by `/props`, and the reproduce
+command pins that resolved number. Use `--context-length N` only when you
+deliberately want a fixed override. Automatic mode rejects `--fit off`/`--no-fit`
+because those options disable the requested fit.
 
 There is no `--server-arg` repetition and no whitespace-split `--server-args`
 string in `eval`; normal shell quoting determines the native argument vector.
@@ -132,9 +139,12 @@ string in `eval`; normal shell quoting determines the native argument vector.
 The versioned evaluation starts `llama-server` once and runs five bounded
 scenarios: a pelican-on-a-bicycle SVG, a self-contained Breakout game, two
 deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
-role-play. It uses temperature 0, seed 42, and at most 2,848 generated tokens in
-total. At 1 tok/s that is under 48 minutes; faster models finish proportionally
-sooner. Use `--dry-run` to inspect the complete signed JSON without submitting.
+role-play. Eval v2 uses temperature 0 and seed 42, sends the two published visual
+prompts without a hidden system prompt, and allows up to 60,000 generated tokens
+for each visual task, 4,096 for each agent task, and 1,024 for each role-play
+turn. The runner does not force a reasoning mode; a native reasoning flag is
+recorded only if the user explicitly supplies it. Use `--dry-run` to inspect the
+complete signed JSON without submitting.
 
 Every evaluation is tied to the GGUF SHA-256, backend build, effective context,
 KV-cache K/V types, flash-attention mode, speculative-decoding settings, and the
@@ -142,7 +152,7 @@ ordered byte-for-byte native argument vector. The server derives a configuration
 fingerprint from those structured values, so Q4 KV-cache evidence never stands
 in for Q8/F16 and speculative decoding never stands in for ordinary decoding.
 External draft models, LoRAs, grammars, projectors, control vectors, and template
-files are rejected in `eval-v1` until the contract can hash every auxiliary
+files are rejected in `eval-v2` until the contract can hash every auxiliary
 artifact. Absolute native path values also fail closed rather than being shortened
 into a potentially colliding config. Built-in speculative decoding and its tuning
 flags are supported.
@@ -150,7 +160,8 @@ flags are supported.
 The site reports separate inspectable outcomes rather than an aggregate
 "intelligence" score. The runner's virtual tools never touch the real filesystem:
 they operate only on fixed in-memory fixtures. Generated SVG is rasterized by the
-server before display, and generated HTML is never executed by llamabench.ai.
+server before display. Generated HTML is downloadable as source and may be shown
+on the site only through an opt-in static iframe where scripts remain disabled.
 
 ### Getting the model and llama.cpp
 

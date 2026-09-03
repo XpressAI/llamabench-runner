@@ -30,7 +30,7 @@ use clap::{Args, Parser, Subcommand};
 use bench::{run_llama_bench, BenchOpts, BenchResult};
 use contract::{
     Backend, EvaluationConfig, EvaluationModel, EvaluationSubmission, Submitter, Verification,
-    EVAL_VERSION, SCHEMA_VERSION,
+    EVAL_SCHEMA_VERSION, EVAL_VERSION,
 };
 use submitter::{
     build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
@@ -49,7 +49,7 @@ SPEED — runner options before `--`, then the native command:
   llamabench speed -- llama-server -m model.gguf -c 8192
 
 EVAL — runner options before `--`, native llama-server arguments after it:
-  llamabench eval --model ./model.gguf --context-length 8192 -- \
+  llamabench eval --model ./model.gguf -- \
     -ctk q4_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2
 
 PROVENANCE:
@@ -259,13 +259,12 @@ struct EvalArgs {
     /// API key used only for the temporary local llama-server session.
     #[arg(long, default_value = "llamabench")]
     api_key: String,
-    /// Context window for the eval. The server-reported effective value is stored.
+    /// Explicit context override. Omit to fit the model-native maximum to hardware.
     #[arg(
         long,
-        default_value_t = 8192,
         value_parser = clap::value_parser!(u32).range(1024..=1_048_576)
     )]
-    context_length: u32,
+    context_length: Option<u32>,
     /// Native llama-server arguments. Put them after `--`; every token is forwarded
     /// in order and becomes part of the exact evaluation configuration.
     #[arg(
@@ -434,7 +433,13 @@ fn shell_word(value: &str) -> String {
     }
 }
 
-fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String]) -> String {
+fn eval_command(
+    a: &EvalArgs,
+    model: &str,
+    quant: &str,
+    context_length: u32,
+    runtime_args: &[String],
+) -> String {
     let model_file = std::path::Path::new(model)
         .file_name()
         .and_then(|s| s.to_str())
@@ -447,7 +452,7 @@ fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String])
         "--quant".to_string(),
         shell_word(quant),
         "--context-length".to_string(),
-        a.context_length.to_string(),
+        context_length.to_string(),
     ];
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
@@ -483,11 +488,12 @@ fn eval_submission(
         agentic_tasks,
         roleplay,
         context_length,
+        context_mode,
         runtime,
     } = run;
-    let command = eval_command(a, model_path, quant, &runtime.args);
+    let command = eval_command(a, model_path, quant, context_length, &runtime.args);
     if command.chars().count() > 8_000 {
-        bail!("eval-v1 reproduce command exceeds 8000 characters");
+        bail!("eval-v2 reproduce command exceeds 8000 characters");
     }
     let fallback_name = submitter::model_name(model_path);
     let (model_id, name) = match (canonical_id, canonical_name) {
@@ -497,7 +503,7 @@ fn eval_submission(
     let params = submitter::params_from_name(&name);
 
     Ok(EvaluationSubmission {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVAL_SCHEMA_VERSION,
         eval_version: EVAL_VERSION.to_string(),
         model: EvaluationModel {
             id: model_id,
@@ -511,6 +517,7 @@ fn eval_submission(
         config: EvaluationConfig {
             quant: quant.to_string(),
             context_length,
+            context_mode,
             kv_cache_key: runtime.kv_cache_key,
             kv_cache_value: runtime.kv_cache_value,
             flash_attention: runtime.flash_attention,
@@ -837,11 +844,18 @@ mod tests {
         let Command::Eval(a) = cli.command else {
             panic!("expected eval")
         };
-        assert_eq!(a.context_length, 8192);
+        assert_eq!(a.context_length, None);
         assert_eq!(a.runtime_args[5], "a template with spaces");
         let runtime = eval::runtime_config(&a.runtime_args).unwrap();
-        let command = eval_command(&a, "/home/edu/model-Q4_K_M.gguf", "Q4_K_M", &runtime.args);
+        let command = eval_command(
+            &a,
+            "/home/edu/model-Q4_K_M.gguf",
+            "Q4_K_M",
+            262_144,
+            &runtime.args,
+        );
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
+        assert!(command.contains("--context-length 262144"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
         assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));
