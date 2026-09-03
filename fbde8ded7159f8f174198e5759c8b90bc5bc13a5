@@ -1,0 +1,1 @@
+Thinking: Current upstream llama.cpp declares -fit and --fit as aliases. Treat either split spelling as ambiguous in automatic mode, reject either inline spelling when disabled, and preserve enabled inline values; fixed-context runs may deliberately use any form. Tests exercise both spellings. Verified against ggml-org/llama.cpp common/arg.cpp. Refs llamabench.ai ADR-016.
