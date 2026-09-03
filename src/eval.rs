@@ -167,7 +167,7 @@ pub fn run_eval(opts: &EvaluationOpts) -> Result<EvaluationRun> {
     let pelican_svg = run_visual(
         opts,
         "pelican-svg-v1",
-        "Return only one self-contained SVG document. Use viewBox=\"0 0 800 600\" and vector shapes only. Do not use scripts, foreignObject, links, embedded files, or external resources.",
+        "Return only one compact, self-contained SVG document under 700 generated tokens. Start with <svg and end with </svg>. Use viewBox=\"0 0 800 600\", simple shapes, flat colors, and at most 20 vector elements; prefer circles, ellipses, lines, polygons, and short paths. Do not use comments, text explanations, markdown fences, scripts, styles, foreignObject, images, links, embedded files, or external resources. If nearing the token limit, close every open element and the SVG immediately.",
         PELICAN_PROMPT,
         false,
     )?;
@@ -1077,23 +1077,47 @@ fn parse_server_version(text: &str) -> Option<(String, String)> {
         let Some(rest) = line.trim().strip_prefix("version:") else {
             continue;
         };
-        let mut parts = rest.split_whitespace();
-        let Some(number) = parts.next() else { continue };
-        let Some(hash) = parts
-            .next()
-            .and_then(|value| value.strip_prefix('('))
-            .and_then(|value| value.strip_suffix(')'))
-        else {
-            continue;
-        };
-        if number.chars().all(|character| character.is_ascii_digit())
-            && hash.len() >= 7
-            && hash.chars().all(|character| character.is_ascii_hexdigit())
-        {
-            return Some((format!("b{number}"), hash.to_string()));
+        if let Some(version) = parse_legacy_server_version(rest) {
+            return Some(version);
+        }
+        if let Some(version) = parse_semantic_server_version(rest) {
+            return Some(version);
         }
     }
     None
+}
+
+fn exact_build(number: &str, hash: &str) -> Option<(String, String)> {
+    if !number.is_empty()
+        && number.chars().all(|character| character.is_ascii_digit())
+        && hash.len() >= 7
+        && hash.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        Some((format!("b{number}"), hash.to_string()))
+    } else {
+        None
+    }
+}
+
+fn parse_legacy_server_version(rest: &str) -> Option<(String, String)> {
+    let mut parts = rest.split_whitespace();
+    let number = parts.next()?;
+    let hash = parts.next()?.strip_prefix('(')?.strip_suffix(')')?;
+    exact_build(number, hash)
+}
+
+fn parse_semantic_server_version(rest: &str) -> Option<(String, String)> {
+    let metadata = rest.rsplit_once('(')?.1.strip_suffix(')')?;
+    let mut build = None;
+    let mut commit = None;
+    for field in metadata.split(',').map(str::trim) {
+        if let Some(value) = field.strip_prefix("build ") {
+            build = Some(value);
+        } else if let Some(value) = field.strip_prefix("commit ") {
+            commit = Some(value);
+        }
+    }
+    exact_build(build?, commit?)
 }
 
 fn server_context(port: u16, api_key: Option<&str>) -> Result<u32> {
@@ -1137,6 +1161,7 @@ mod tests {
             extract_html("Here:\n<!doctype html><html><body>ok</body></html> trailing").as_deref(),
             Some("<!doctype html><html><body>ok</body></html>")
         );
+        assert_eq!(extract_svg("<svg viewBox=\"0 0 1 1\"><path/>"), None);
     }
 
     #[test]
@@ -1295,8 +1320,18 @@ mod tests {
             parse_server_version("version: 9999 (abcdef12)\n").unwrap(),
             ("b9999".to_string(), "abcdef12".to_string())
         );
+        assert_eq!(
+            parse_server_version("version: 0.3.0-dev (build 10621, commit c1d0e7a004015f23)\n")
+                .unwrap(),
+            ("b10621".to_string(), "c1d0e7a004015f23".to_string())
+        );
         assert!(parse_server_version("llama.cpp custom build").is_none());
         assert!(parse_server_version("version: unknown (unknown)").is_none());
+        assert!(parse_server_version("version: 0.3.0-dev (build 10621)").is_none());
+        assert!(parse_server_version("version: 0.3.0-dev (commit c1d0e7a0)").is_none());
+        assert!(
+            parse_server_version("version: 0.3.0-dev (build nightly, commit c1d0e7a0)").is_none()
+        );
     }
 
     #[test]
