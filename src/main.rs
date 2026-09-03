@@ -262,7 +262,7 @@ struct EvalArgs {
     /// Explicit context override. Omit to fit the model-native maximum to hardware.
     #[arg(
         long,
-        value_parser = clap::value_parser!(u32).range(1024..=1_048_576)
+        value_parser = clap::value_parser!(u32).range(1024..=2_147_483_647)
     )]
     context_length: Option<u32>,
     /// Native llama-server arguments. Put them after `--`; every token is forwarded
