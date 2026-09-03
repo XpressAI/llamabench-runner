@@ -24,7 +24,7 @@ mod link;
 mod submitter;
 mod verify;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use bench::{run_llama_bench, BenchOpts, BenchResult};
@@ -438,8 +438,15 @@ fn eval_command(
     model: &str,
     quant: &str,
     context_length: u32,
+    parallel: u32,
     runtime_args: &[String],
-) -> String {
+) -> Result<String> {
+    let reproduce_context = context_length
+        .checked_mul(parallel)
+        .filter(|value| *value <= i32::MAX as u32)
+        .context(
+            "resolved per-request context and parallel count exceed the reproduce-command limit",
+        )?;
     let model_file = std::path::Path::new(model)
         .file_name()
         .and_then(|s| s.to_str())
@@ -452,7 +459,7 @@ fn eval_command(
         "--quant".to_string(),
         shell_word(quant),
         "--context-length".to_string(),
-        context_length.to_string(),
+        reproduce_context.to_string(),
     ];
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
@@ -461,7 +468,7 @@ fn eval_command(
         parts.push("--".to_string());
         parts.extend(runtime_args.iter().map(|arg| shell_word(arg)));
     }
-    parts.join(" ")
+    Ok(parts.join(" "))
 }
 
 fn eval_submission(
@@ -491,7 +498,14 @@ fn eval_submission(
         context_mode,
         runtime,
     } = run;
-    let command = eval_command(a, model_path, quant, context_length, &runtime.args);
+    let command = eval_command(
+        a,
+        model_path,
+        quant,
+        context_length,
+        runtime.parallel,
+        &runtime.args,
+    )?;
     if command.chars().count() > 8_000 {
         bail!("eval-v2 reproduce command exceeds 8000 characters");
     }
@@ -852,8 +866,10 @@ mod tests {
             "/home/edu/model-Q4_K_M.gguf",
             "Q4_K_M",
             262_144,
+            runtime.parallel,
             &runtime.args,
-        );
+        )
+        .unwrap();
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--context-length 262144"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
@@ -861,6 +877,7 @@ mod tests {
         assert!(!command.contains("/home/edu"));
         assert_eq!(runtime.kv_cache_key, "q4_0");
         assert_eq!(runtime.kv_cache_value, "q4_0");
+        assert_eq!(runtime.parallel, 1);
         assert_eq!(runtime.speculative_decoding.mode, "draft-mtp");
         assert_eq!(
             runtime.speculative_decoding.parameters,
@@ -898,6 +915,34 @@ mod tests {
             panic!("expected eval")
         };
         assert_eq!(large.context_length, Some(2_000_000));
+    }
+
+    #[test]
+    fn eval_reproduce_command_preserves_parallel_slot_context() {
+        let cli = Cli::parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--",
+            "-np",
+            "2",
+        ]);
+        let Command::Eval(a) = cli.command else {
+            panic!("expected eval")
+        };
+        let runtime = eval::runtime_config(&a.runtime_args).unwrap();
+        assert_eq!(runtime.parallel, 2);
+        let command = eval_command(
+            &a,
+            "model.gguf",
+            "Q4_K_M",
+            262_144,
+            runtime.parallel,
+            &runtime.args,
+        )
+        .unwrap();
+        assert!(command.contains("--context-length 524288 -- -np 2"));
     }
 
     #[test]

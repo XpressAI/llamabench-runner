@@ -128,10 +128,12 @@ llamabench eval --model /path/to/model-Q4_K_M.gguf \
 
 By default the runner does not pass `-c`: llama.cpp starts from the model-native
 context and fits the largest effective context it can to the available hardware.
-The runner records the positive value reported by `/props`, and the reproduce
-command pins that resolved number. Use `--context-length N` only when you
-deliberately want a fixed override. Automatic mode rejects `--fit off`/`--no-fit`
-because those options disable the requested fit.
+The runner records the positive per-request value reported by `/props`, and the
+reproduce command pins the server context needed to recreate it. With multiple
+parallel slots, that command multiplies the per-request value by the slot count
+because llama.cpp splits its total `-c` value across slots. Use
+`--context-length N` only when you deliberately want a fixed override. Automatic
+mode rejects `--fit off`/`--no-fit` because those options disable the requested fit.
 
 There is no `--server-arg` repetition and no whitespace-split `--server-args`
 string in `eval`; normal shell quoting determines the native argument vector.
@@ -142,9 +144,10 @@ deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
 role-play. Eval v2 uses temperature 0 and seed 42, sends the two published visual
 prompts without a hidden system prompt, and allows up to 60,000 generated tokens
 for each visual task, 4,096 for each agent task, and 1,024 for each role-play
-turn. The runner does not force a reasoning mode; a native reasoning flag is
-recorded only if the user explicitly supplies it. Use `--dry-run` to inspect the
-complete signed JSON without submitting.
+turn. A visual request may take up to 24 hours, and each role-play answer retains
+up to 65,536 characters. The runner does not force a reasoning mode; a native
+reasoning flag is recorded only if the user explicitly supplies it. Use
+`--dry-run` to inspect the complete signed JSON without submitting.
 
 Every evaluation is tied to the GGUF SHA-256, backend build, effective context,
 KV-cache K/V types, flash-attention mode, speculative-decoding settings, and the

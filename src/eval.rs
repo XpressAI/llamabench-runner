@@ -28,7 +28,10 @@ pub const SEED: u64 = 42;
 const PELICAN_PROMPT: &str = "Generate an SVG of a pelican riding a bicycle";
 const BREAKOUT_PROMPT: &str = "Can you make a simple breakout game in HTML?";
 const MAX_OUTPUT_CHARS: usize = 2_000_000;
-const MAX_EVIDENCE_CHARS: usize = 4_000;
+const MAX_AGENT_EVIDENCE_CHARS: usize = 4_000;
+const MAX_ROLEPLAY_ANSWER_CHARS: usize = 65_536;
+const STANDARD_CHAT_TIMEOUT_SECS: u64 = 7_200;
+const VISUAL_CHAT_TIMEOUT_SECS: u64 = 86_000;
 const CONTROLLED_SERVER_FLAGS: &[&str] = &[
     "-m",
     "--model",
@@ -97,6 +100,7 @@ pub struct EvaluationOpts<'a> {
 
 pub struct RuntimeConfig {
     pub args: Vec<String>,
+    pub parallel: u32,
     pub kv_cache_key: String,
     pub kv_cache_value: String,
     pub flash_attention: String,
@@ -266,6 +270,19 @@ fn runtime_disables_fit(args: &[String]) -> bool {
     })
 }
 
+fn runtime_parallel(args: &[String]) -> Result<u32> {
+    let Some(value) = last_runtime_value(args, &["-np", "--parallel"]) else {
+        return Ok(1);
+    };
+    let Ok(parallel) = value.parse::<u32>() else {
+        bail!("eval-v2 requires -np/--parallel to be a positive integer");
+    };
+    if parallel == 0 {
+        bail!("eval-v2 requires -np/--parallel to be a positive integer");
+    }
+    Ok(parallel)
+}
+
 fn canonical_runtime_flags(args: &[String], predicate: impl Fn(&str) -> bool) -> Vec<String> {
     let mut values = Vec::new();
     let mut index = 0;
@@ -412,12 +429,14 @@ pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
     .to_string();
     let mode = speculative_mode(args);
     let exact_args = exact_runtime_args(args)?;
+    let parallel = runtime_parallel(&exact_args)?;
     let parameters = canonical_runtime_flags(&exact_args, is_spec_parameter_flag);
     if parameters.len() > 64 || parameters.iter().any(|value| value.chars().count() > 500) {
         bail!("eval-v2 accepts at most 64 speculative overrides of at most 500 characters each");
     }
     Ok(RuntimeConfig {
         args: exact_args,
+        parallel,
         kv_cache_key,
         kv_cache_value,
         flash_attention,
@@ -433,7 +452,13 @@ fn run_visual(
 ) -> Result<VisualArtifact> {
     let start = Instant::now();
     let messages = visual_messages(prompt);
-    let reply = chat(opts, &messages, None, VISUAL_MAX_TOKENS)?;
+    let reply = chat(
+        opts,
+        &messages,
+        None,
+        VISUAL_MAX_TOKENS,
+        VISUAL_CHAT_TIMEOUT_SECS,
+    )?;
     let raw = reply.visible_output();
     let output = if breakout {
         extract_html(&raw).unwrap_or_else(|| bounded(&raw, MAX_OUTPUT_CHARS))
@@ -464,6 +489,7 @@ fn chat(
     messages: &[Value],
     tools: Option<&Value>,
     max_tokens: u32,
+    timeout_secs: u64,
 ) -> Result<ChatReply> {
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", opts.port);
     let mut body = json!({
@@ -478,7 +504,7 @@ fn chat(
         body["tool_choice"] = json!("auto");
     }
     let resp = ureq::post(&url)
-        .timeout(Duration::from_secs(7_200))
+        .timeout(Duration::from_secs(timeout_secs))
         .set("Authorization", &format!("Bearer {}", opts.api_key))
         .send_json(body)
         .map_err(|e| anyhow::anyhow!("eval chat request failed: {e}"))?;
@@ -534,7 +560,13 @@ fn run_agent_task<H: AgentHarness>(
             failure = Some("generation token ceiling reached before completion".to_string());
             break;
         }
-        let reply = match chat(opts, &messages, Some(&tools), remaining) {
+        let reply = match chat(
+            opts,
+            &messages,
+            Some(&tools),
+            remaining,
+            STANDARD_CHAT_TIMEOUT_SECS,
+        ) {
             Ok(reply) => reply,
             Err(e) => {
                 failure = Some(format!("engine error: {e}"));
@@ -545,7 +577,7 @@ fn run_agent_task<H: AgentHarness>(
         let requested = requested_tools(&reply.message);
         messages.push(reply.message.clone());
         if requested.is_empty() {
-            final_output = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
+            final_output = bounded(&reply.visible_output(), MAX_AGENT_EVIDENCE_CHARS);
             break;
         }
         for call in requested {
@@ -802,9 +834,15 @@ fn run_roleplay(opts: &EvaluationOpts) -> Result<RoleplayResult> {
     let mut turns = Vec::new();
     for (id, question) in questions {
         messages.push(json!({"role": "user", "content": question}));
-        let reply = chat(opts, &messages, None, ROLEPLAY_MAX_TOKENS_PER_TURN)?;
+        let reply = chat(
+            opts,
+            &messages,
+            None,
+            ROLEPLAY_MAX_TOKENS_PER_TURN,
+            STANDARD_CHAT_TIMEOUT_SECS,
+        )?;
         let turn_tokens = reply.generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN);
-        let answer = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
+        let answer = bounded(&reply.visible_output(), MAX_ROLEPLAY_ANSWER_CHARS);
         messages.push(json!({"role": "assistant", "content": answer}));
         turns.push(RoleplayTurn {
             question_id: id.to_string(),
@@ -1482,6 +1520,22 @@ mod tests {
         assert!(runtime_config(&[String::new()]).is_err());
         assert!(runtime_config(&[format!("--chat-template={}", "x".repeat(2_001))]).is_err());
         assert!(runtime_config(&[format!("--spec-custom={}", "x".repeat(501))]).is_err());
+        for invalid_parallel in [
+            vec!["-np".to_string(), "0".to_string()],
+            vec!["--parallel=none".to_string()],
+        ] {
+            assert!(runtime_config(&invalid_parallel).is_err());
+        }
+        assert_eq!(
+            runtime_config(&[
+                "-np".to_string(),
+                "2".to_string(),
+                "--parallel=4".to_string(),
+            ])
+            .unwrap()
+            .parallel,
+            4
+        );
     }
 
     #[test]
