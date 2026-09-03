@@ -79,7 +79,7 @@ enum Command {
     /// Full run: speed + verification → a complete ResultSubmission.
     #[command(hide = true)]
     Run(RunArgs),
-    /// Evaluate one exact GGUF/runtime with fixed visual, tool-use, and role-play tasks.
+    /// Evaluate one exact GGUF/runtime with versioned visual, tool-use, and role-play tasks.
     Eval(EvalArgs),
 }
 
@@ -885,6 +885,19 @@ mod tests {
             "512",
         ])
         .is_err());
+        let large = Cli::try_parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--context-length",
+            "2000000",
+        ])
+        .unwrap();
+        let Command::Eval(large) = large.command else {
+            panic!("expected eval")
+        };
+        assert_eq!(large.context_length, Some(2_000_000));
     }
 
     #[test]
