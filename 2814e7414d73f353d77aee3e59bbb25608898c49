@@ -1,0 +1,1 @@
+Thinking: The prior 1,048,576 context maximum was a schema implementation detail, not an evaluation policy. This follow-up documents the command as versioned rather than fixed and proves that explicit contexts above one million still parse. Auto-fit remains the default and imposes no numeric request. Refs ADR-016.
