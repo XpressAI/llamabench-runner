@@ -1,0 +1,1 @@
+Thinking: The runner should make invalid eval-v2 states unrepresentable before submission. Auto-fit rejects every schema-forbidden split/disabled fit form while retaining explicit enabled equals syntax, and an empty visual with nonzero backend usage now fails instead of publishing contradictory evidence. Refs ADR-005 and ADR-016.
