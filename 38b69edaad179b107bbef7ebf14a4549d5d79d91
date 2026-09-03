@@ -1,0 +1,1 @@
+Thinking: Automatic context can legitimately resolve above eval-v1's one-million-token validation cap. Let the explicit override span Postgres's signed integer representation too; model/backend/hardware fitting remains the real limit. Refs ADR-005, ADR-016.
