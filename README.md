@@ -144,10 +144,11 @@ deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
 role-play. Eval v2 uses temperature 0 and seed 42, sends the two published visual
 prompts without a hidden system prompt, and allows up to 60,000 generated tokens
 for each visual task, 4,096 for each agent task, and 1,024 for each role-play
-turn. A visual request may take up to 24 hours, and each role-play answer retains
-up to 65,536 characters. The runner does not force a reasoning mode; a native
-reasoning flag is recorded only if the user explicitly supplies it. Use
-`--dry-run` to inspect the complete signed JSON without submitting.
+turn. A visual request may take up to 24 hours, each agent final response retains
+up to 262,144 characters, and each role-play answer retains up to 65,536
+characters. The runner does not force a reasoning mode; a native reasoning flag
+is recorded only if the user explicitly supplies it. Use `--dry-run` to inspect
+the complete signed JSON without submitting.
 
 Every evaluation is tied to the GGUF SHA-256, backend build, effective context,
 KV-cache K/V types, flash-attention mode, speculative-decoding settings, and the

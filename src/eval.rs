@@ -28,7 +28,7 @@ pub const SEED: u64 = 42;
 const PELICAN_PROMPT: &str = "Generate an SVG of a pelican riding a bicycle";
 const BREAKOUT_PROMPT: &str = "Can you make a simple breakout game in HTML?";
 const MAX_OUTPUT_CHARS: usize = 2_000_000;
-const MAX_AGENT_EVIDENCE_CHARS: usize = 4_000;
+const MAX_AGENT_EVIDENCE_CHARS: usize = 262_144;
 const MAX_ROLEPLAY_ANSWER_CHARS: usize = 65_536;
 const STANDARD_CHAT_TIMEOUT_SECS: u64 = 7_200;
 const VISUAL_CHAT_TIMEOUT_SECS: u64 = 86_000;
@@ -1536,6 +1536,20 @@ mod tests {
             .parallel,
             4
         );
+    }
+
+    #[test]
+    fn evidence_bounds_preserve_the_disclosed_token_budgets() {
+        let agent = bounded(
+            &"x".repeat(MAX_AGENT_EVIDENCE_CHARS + 1),
+            MAX_AGENT_EVIDENCE_CHARS,
+        );
+        let roleplay = bounded(
+            &"x".repeat(MAX_ROLEPLAY_ANSWER_CHARS + 1),
+            MAX_ROLEPLAY_ANSWER_CHARS,
+        );
+        assert_eq!(agent.chars().count(), 262_144);
+        assert_eq!(roleplay.chars().count(), 65_536);
     }
 
     #[test]
