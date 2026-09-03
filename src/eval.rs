@@ -416,12 +416,7 @@ fn run_visual(
     let output = if breakout {
         extract_html(&raw).unwrap_or_else(|| bounded(&raw, MAX_OUTPUT_CHARS))
     } else {
-        extract_svg(&raw).with_context(|| {
-            format!(
-                "pelican eval returned no complete <svg>...</svg> document after {} generated tokens",
-                reply.generated_tokens.min(VISUAL_MAX_TOKENS)
-            )
-        })?
+        extract_svg(&raw).unwrap_or_else(|| bounded(&raw, MAX_OUTPUT_CHARS))
     };
     let checks = if breakout {
         breakout_checks(&output)
