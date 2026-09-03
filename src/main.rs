@@ -433,6 +433,24 @@ fn shell_word(value: &str) -> String {
     }
 }
 
+fn eval_model_file(model: &str) -> Result<String> {
+    let model_file = std::path::Path::new(model)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("eval-v2 requires a UTF-8 GGUF filename")?;
+    if model_file.is_empty()
+        || matches!(model_file, "." | "..")
+        || model_file.chars().count() > 255
+        || model_file.contains(['/', '\\'])
+        || model_file
+            .chars()
+            .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("eval-v2 requires a path-free GGUF basename of at most 255 characters");
+    }
+    Ok(model_file.to_string())
+}
+
 fn eval_command(
     a: &EvalArgs,
     model: &str,
@@ -447,10 +465,7 @@ fn eval_command(
         .context(
             "resolved per-request context and parallel count exceed the reproduce-command limit",
         )?;
-    let model_file = std::path::Path::new(model)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(model);
+    let model_file = eval_model_file(model)?;
     let mut parts = vec![
         "llamabench".to_string(),
         "eval".to_string(),
@@ -498,6 +513,12 @@ fn eval_submission(
         context_mode,
         runtime,
     } = run;
+    if quant
+        .chars()
+        .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("eval-v2 quant cannot contain control characters");
+    }
     let command = eval_command(
         a,
         model_path,
@@ -509,6 +530,7 @@ fn eval_submission(
     if command.chars().count() > 8_000 {
         bail!("eval-v2 reproduce command exceeds 8000 characters");
     }
+    let gguf_file = eval_model_file(model_path)?;
     let fallback_name = submitter::model_name(model_path);
     let (model_id, name) = match (canonical_id, canonical_name) {
         (Some(id), Some(name)) => (id, name),
@@ -526,6 +548,7 @@ fn eval_submission(
             base_model,
             hf_model,
             hf_verified,
+            gguf_file,
             gguf_sha256,
         },
         config: EvaluationConfig {
@@ -727,6 +750,7 @@ fn main() -> Result<()> {
                 },
             )?;
             eval::sign(&mut submission)?;
+            eprintln!("\nReproduce: {}", submission.config.command);
             println!("{}", serde_json::to_string_pretty(&submission)?);
             match token {
                 Some(token) => submitter::submit_eval(&a.api, &token, &submission)?,
@@ -843,6 +867,8 @@ mod tests {
             "eval",
             "--model",
             "/home/edu/model-Q4_K_M.gguf",
+            "--family",
+            "ik_llama.cpp",
             "--",
             "-ctk",
             "q4_0",
@@ -872,9 +898,15 @@ mod tests {
         .unwrap();
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--context-length 262144"));
+        assert!(command.contains("--family ik_llama.cpp"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
         assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));
+        assert_eq!(
+            eval_model_file("/home/edu/model-Q4_K_M.gguf").unwrap(),
+            "model-Q4_K_M.gguf"
+        );
+        assert!(eval_model_file("folder\\model.gguf").is_err());
         assert_eq!(runtime.kv_cache_key, "q4_0");
         assert_eq!(runtime.kv_cache_value, "q4_0");
         assert_eq!(runtime.parallel, 1);

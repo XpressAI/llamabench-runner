@@ -399,8 +399,13 @@ pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
     }
     for arg in args {
         let length = arg.chars().count();
-        if length == 0 || length > 2_000 {
-            bail!("each eval-v2 native argument must contain 1..=2000 characters");
+        if length == 0
+            || length > 2_000
+            || arg
+                .chars()
+                .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+        {
+            bail!("each eval-v2 native argument must contain 1..=2000 characters and no control characters");
         }
         let flag = runtime_flag(arg);
         if CONTROLLED_SERVER_FLAGS.contains(&flag) || is_model_preset_flag(flag) {
@@ -1543,6 +1548,7 @@ mod tests {
         assert!(runtime_config(&vec!["--verbose".to_string(); 257]).is_err());
         assert!(runtime_config(&[String::new()]).is_err());
         assert!(runtime_config(&[format!("--chat-template={}", "x".repeat(2_001))]).is_err());
+        assert!(runtime_config(&["value\n--api-key=secret".to_string()]).is_err());
         assert!(runtime_config(&[format!("--spec-custom={}", "x".repeat(501))]).is_err());
         for invalid_parallel in [
             vec!["-np".to_string(), "0".to_string()],

@@ -247,6 +247,8 @@ pub struct EvaluationModel {
     pub hf_model: Option<String>,
     #[serde(rename = "hfVerified", skip_serializing_if = "Option::is_none")]
     pub hf_verified: Option<bool>,
+    #[serde(rename = "ggufFile")]
+    pub gguf_file: String,
     #[serde(rename = "ggufSha256")]
     pub gguf_sha256: String,
 }
@@ -268,6 +270,9 @@ pub struct EvaluationConfig {
     pub speculative_decoding: SpeculativeDecodingConfig,
     #[serde(rename = "runtimeArgs")]
     pub runtime_args: Vec<String>,
+    /// Local display only. Eval-v2 omits this from the signed wire payload so the
+    /// server can derive the public command from the validated structured fields.
+    #[serde(skip)]
     pub command: String,
 }
 
@@ -393,5 +398,22 @@ mod tests {
         assert_eq!(json["flashAttention"], "auto");
         assert_eq!(json["speculativeDecoding"]["mode"], "draft-mtp");
         assert_eq!(json["runtimeArgs"][0], "-ctk");
+        assert!(json.get("command").is_none());
+    }
+
+    #[test]
+    fn evaluation_model_serializes_the_reproduce_basename() {
+        let model = EvaluationModel {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            params: 8.0,
+            base_model: None,
+            hf_model: None,
+            hf_verified: None,
+            gguf_file: "model-Q4_K_M.gguf".to_string(),
+            gguf_sha256: "ab".repeat(32),
+        };
+        let json = serde_json::to_value(model).unwrap();
+        assert_eq!(json["ggufFile"], "model-Q4_K_M.gguf");
     }
 }
