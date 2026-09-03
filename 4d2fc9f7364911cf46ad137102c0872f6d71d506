@@ -1,0 +1,1 @@
+Thinking: The runner must not truncate valid 4,096-token agent evidence before hashing it. Use the contract's conservative 262,144-character v2 allowance and retain the separate 65,536-character role-play limit; a unit test locks both truncation boundaries. Refs ADR-005 and ADR-016.
