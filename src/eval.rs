@@ -154,8 +154,8 @@ fn evaluation_server_args(
     context_length: Option<u32>,
     runtime_args: &[String],
 ) -> Result<Vec<String>> {
-    if context_length.is_none() && runtime_disables_fit(runtime_args) {
-        bail!("automatic context selection requires llama.cpp parameter fitting; remove `--fit off`/`--no-fit` or pass an explicit --context-length");
+    if context_length.is_none() && runtime_conflicts_with_auto_fit(runtime_args) {
+        bail!("automatic context selection requires unambiguous llama.cpp parameter fitting; use an enabled `--fit=VALUE` form or pass an explicit --context-length");
     }
     let mut server_args = Vec::new();
     if let Some(context_length) = context_length {
@@ -258,15 +258,17 @@ fn last_runtime_value(args: &[String], names: &[&str]) -> Option<String> {
     value
 }
 
-fn runtime_disables_fit(args: &[String]) -> bool {
-    if args.iter().any(|arg| runtime_flag(arg) == "--no-fit") {
-        return true;
-    }
-    last_runtime_value(args, &["--fit"]).is_some_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "disabled"
-        )
+fn runtime_conflicts_with_auto_fit(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        if arg == "--fit" || runtime_flag(arg) == "--no-fit" {
+            return true;
+        }
+        arg.strip_prefix("--fit=").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "disabled"
+            )
+        })
     })
 }
 
@@ -470,14 +472,23 @@ fn run_visual(
     } else {
         Vec::new()
     };
+    let generated_tokens = visual_generated_tokens(&output, reply.generated_tokens)?;
     Ok(VisualArtifact {
         prompt_id: prompt_id.to_string(),
         output_sha256: sha256_hex(&output),
         output,
         duration_ms: elapsed_ms(start),
-        generated_tokens: reply.generated_tokens.min(VISUAL_MAX_TOKENS),
+        generated_tokens,
         checks,
     })
+}
+
+fn visual_generated_tokens(output: &str, generated_tokens: u32) -> Result<u32> {
+    let generated_tokens = generated_tokens.min(VISUAL_MAX_TOKENS);
+    if output.is_empty() && generated_tokens != 0 {
+        bail!("llama-server reported generated tokens for an empty visual response");
+    }
+    Ok(generated_tokens)
 }
 
 fn visual_messages(prompt: &str) -> Vec<Value> {
@@ -1378,11 +1389,24 @@ mod tests {
         for disabled in [
             vec!["--fit".to_string(), "off".to_string()],
             vec!["--fit=0".to_string()],
+            vec!["--fit=FALSE".to_string()],
             vec!["--no-fit".to_string()],
         ] {
             assert!(evaluation_server_args(None, &disabled).is_err());
             assert!(evaluation_server_args(Some(8192), &disabled).is_ok());
         }
+        assert!(evaluation_server_args(None, &["--fit".to_string(), "on".to_string()]).is_err());
+        assert_eq!(
+            evaluation_server_args(None, &["--fit=on".to_string()]).unwrap(),
+            vec!["--fit=on"]
+        );
+    }
+
+    #[test]
+    fn empty_visuals_require_zero_generated_tokens() {
+        assert_eq!(visual_generated_tokens("", 0).unwrap(), 0);
+        assert!(visual_generated_tokens("", 1).is_err());
+        assert_eq!(visual_generated_tokens("<svg />", 12).unwrap(), 12);
     }
 
     #[test]
