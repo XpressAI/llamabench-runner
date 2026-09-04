@@ -151,6 +151,18 @@ pub const EVAL_VERSION: &str = "eval-v2";
 pub struct EvaluationSettings {
     pub seed: u64,
     pub temperature: f64,
+    #[serde(rename = "topK")]
+    pub top_k: u32,
+    #[serde(rename = "topP")]
+    pub top_p: f64,
+    #[serde(rename = "minP")]
+    pub min_p: f64,
+    #[serde(rename = "presencePenalty")]
+    pub presence_penalty: f64,
+    #[serde(rename = "frequencyPenalty")]
+    pub frequency_penalty: f64,
+    #[serde(rename = "repeatPenalty")]
+    pub repeat_penalty: f64,
     #[serde(rename = "visualMaxTokens")]
     pub visual_max_tokens: u32,
     #[serde(rename = "agentTaskMaxTokens")]
