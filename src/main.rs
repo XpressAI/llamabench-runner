@@ -24,13 +24,13 @@ mod link;
 mod submitter;
 mod verify;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use bench::{run_llama_bench, BenchOpts, BenchResult};
 use contract::{
     Backend, EvaluationConfig, EvaluationModel, EvaluationSubmission, Submitter, Verification,
-    EVAL_VERSION, SCHEMA_VERSION,
+    EVAL_SCHEMA_VERSION, EVAL_VERSION,
 };
 use submitter::{
     build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
@@ -49,7 +49,7 @@ SPEED — runner options before `--`, then the native command:
   llamabench speed -- llama-server -m model.gguf -c 8192
 
 EVAL — runner options before `--`, native llama-server arguments after it:
-  llamabench eval --model ./model.gguf --context-length 8192 -- \
+  llamabench eval --model ./model.gguf -- \
     -ctk q4_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2
 
 PROVENANCE:
@@ -79,7 +79,7 @@ enum Command {
     /// Full run: speed + verification → a complete ResultSubmission.
     #[command(hide = true)]
     Run(RunArgs),
-    /// Evaluate one exact GGUF/runtime with fixed visual, tool-use, and role-play tasks.
+    /// Evaluate one exact GGUF/runtime with versioned visual, tool-use, and role-play tasks.
     Eval(EvalArgs),
 }
 
@@ -259,13 +259,12 @@ struct EvalArgs {
     /// API key used only for the temporary local llama-server session.
     #[arg(long, default_value = "llamabench")]
     api_key: String,
-    /// Context window for the eval. The server-reported effective value is stored.
+    /// Explicit context override. Omit to fit the model-native maximum to hardware.
     #[arg(
         long,
-        default_value_t = 8192,
-        value_parser = clap::value_parser!(u32).range(1024..=1_048_576)
+        value_parser = clap::value_parser!(u32).range(1024..=2_147_483_647)
     )]
-    context_length: u32,
+    context_length: Option<u32>,
     /// Native llama-server arguments. Put them after `--`; every token is forwarded
     /// in order and becomes part of the exact evaluation configuration.
     #[arg(
@@ -434,11 +433,39 @@ fn shell_word(value: &str) -> String {
     }
 }
 
-fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String]) -> String {
+fn eval_model_file(model: &str) -> Result<String> {
     let model_file = std::path::Path::new(model)
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(model);
+        .and_then(|value| value.to_str())
+        .context("eval-v2 requires a UTF-8 GGUF filename")?;
+    if model_file.is_empty()
+        || matches!(model_file, "." | "..")
+        || model_file.chars().count() > 255
+        || model_file.contains(['/', '\\'])
+        || model_file
+            .chars()
+            .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("eval-v2 requires a path-free GGUF basename of at most 255 characters");
+    }
+    Ok(model_file.to_string())
+}
+
+fn eval_command(
+    a: &EvalArgs,
+    model: &str,
+    quant: &str,
+    context_length: u32,
+    parallel: u32,
+    runtime_args: &[String],
+) -> Result<String> {
+    let reproduce_context = context_length
+        .checked_mul(parallel)
+        .filter(|value| *value <= i32::MAX as u32)
+        .context(
+            "resolved per-request context and parallel count exceed the reproduce-command limit",
+        )?;
+    let model_file = eval_model_file(model)?;
     let mut parts = vec![
         "llamabench".to_string(),
         "eval".to_string(),
@@ -447,7 +474,7 @@ fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String])
         "--quant".to_string(),
         shell_word(quant),
         "--context-length".to_string(),
-        a.context_length.to_string(),
+        reproduce_context.to_string(),
     ];
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
@@ -456,7 +483,7 @@ fn eval_command(a: &EvalArgs, model: &str, quant: &str, runtime_args: &[String])
         parts.push("--".to_string());
         parts.extend(runtime_args.iter().map(|arg| shell_word(arg)));
     }
-    parts.join(" ")
+    Ok(parts.join(" "))
 }
 
 fn eval_submission(
@@ -483,12 +510,27 @@ fn eval_submission(
         agentic_tasks,
         roleplay,
         context_length,
+        context_mode,
         runtime,
     } = run;
-    let command = eval_command(a, model_path, quant, &runtime.args);
-    if command.chars().count() > 8_000 {
-        bail!("eval-v1 reproduce command exceeds 8000 characters");
+    if quant
+        .chars()
+        .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("eval-v2 quant cannot contain control characters");
     }
+    let command = eval_command(
+        a,
+        model_path,
+        quant,
+        context_length,
+        runtime.parallel,
+        &runtime.args,
+    )?;
+    if command.chars().count() > 8_000 {
+        bail!("eval-v2 reproduce command exceeds 8000 characters");
+    }
+    let gguf_file = eval_model_file(model_path)?;
     let fallback_name = submitter::model_name(model_path);
     let (model_id, name) = match (canonical_id, canonical_name) {
         (Some(id), Some(name)) => (id, name),
@@ -497,7 +539,7 @@ fn eval_submission(
     let params = submitter::params_from_name(&name);
 
     Ok(EvaluationSubmission {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVAL_SCHEMA_VERSION,
         eval_version: EVAL_VERSION.to_string(),
         model: EvaluationModel {
             id: model_id,
@@ -506,11 +548,13 @@ fn eval_submission(
             base_model,
             hf_model,
             hf_verified,
+            gguf_file,
             gguf_sha256,
         },
         config: EvaluationConfig {
             quant: quant.to_string(),
             context_length,
+            context_mode,
             kv_cache_key: runtime.kv_cache_key,
             kv_cache_value: runtime.kv_cache_value,
             flash_attention: runtime.flash_attention,
@@ -706,6 +750,7 @@ fn main() -> Result<()> {
                 },
             )?;
             eval::sign(&mut submission)?;
+            eprintln!("\nReproduce: {}", submission.config.command);
             println!("{}", serde_json::to_string_pretty(&submission)?);
             match token {
                 Some(token) => submitter::submit_eval(&a.api, &token, &submission)?,
@@ -822,6 +867,8 @@ mod tests {
             "eval",
             "--model",
             "/home/edu/model-Q4_K_M.gguf",
+            "--family",
+            "ik_llama.cpp",
             "--",
             "-ctk",
             "q4_0",
@@ -837,16 +884,32 @@ mod tests {
         let Command::Eval(a) = cli.command else {
             panic!("expected eval")
         };
-        assert_eq!(a.context_length, 8192);
+        assert_eq!(a.context_length, None);
         assert_eq!(a.runtime_args[5], "a template with spaces");
         let runtime = eval::runtime_config(&a.runtime_args).unwrap();
-        let command = eval_command(&a, "/home/edu/model-Q4_K_M.gguf", "Q4_K_M", &runtime.args);
+        let command = eval_command(
+            &a,
+            "/home/edu/model-Q4_K_M.gguf",
+            "Q4_K_M",
+            262_144,
+            runtime.parallel,
+            &runtime.args,
+        )
+        .unwrap();
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
+        assert!(command.contains("--context-length 262144"));
+        assert!(command.contains("--family ik_llama.cpp"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
         assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));
+        assert_eq!(
+            eval_model_file("/home/edu/model-Q4_K_M.gguf").unwrap(),
+            "model-Q4_K_M.gguf"
+        );
+        assert!(eval_model_file("folder\\model.gguf").is_err());
         assert_eq!(runtime.kv_cache_key, "q4_0");
         assert_eq!(runtime.kv_cache_value, "q4_0");
+        assert_eq!(runtime.parallel, 1);
         assert_eq!(runtime.speculative_decoding.mode, "draft-mtp");
         assert_eq!(
             runtime.speculative_decoding.parameters,
@@ -871,6 +934,47 @@ mod tests {
             "512",
         ])
         .is_err());
+        let large = Cli::try_parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--context-length",
+            "2000000",
+        ])
+        .unwrap();
+        let Command::Eval(large) = large.command else {
+            panic!("expected eval")
+        };
+        assert_eq!(large.context_length, Some(2_000_000));
+    }
+
+    #[test]
+    fn eval_reproduce_command_preserves_parallel_slot_context() {
+        let cli = Cli::parse_from([
+            "llamabench",
+            "eval",
+            "--model",
+            "model.gguf",
+            "--",
+            "-np",
+            "2",
+        ]);
+        let Command::Eval(a) = cli.command else {
+            panic!("expected eval")
+        };
+        let runtime = eval::runtime_config(&a.runtime_args).unwrap();
+        assert_eq!(runtime.parallel, 2);
+        let command = eval_command(
+            &a,
+            "model.gguf",
+            "Q4_K_M",
+            262_144,
+            runtime.parallel,
+            &runtime.args,
+        )
+        .unwrap();
+        assert!(command.contains("--context-length 524288 -- -np 2"));
     }
 
     #[test]

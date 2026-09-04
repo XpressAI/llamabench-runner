@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Opt-in exact-configuration behavior evaluation (ADR-014).
+//! Opt-in exact-configuration behavior evaluation (ADR-014 / ADR-016).
 //!
 //! Starts the user's existing llama-server once, then runs two inspectable visual
 //! prompts, two deterministic virtual-tool tasks, and a three-turn public-domain
@@ -20,15 +20,18 @@ use crate::contract::{
 };
 use crate::verify::{self, VerifyOpts};
 
-pub const VISUAL_MAX_TOKENS: u32 = 1024;
-pub const AGENT_TASK_MAX_TOKENS: u32 = 256;
-pub const ROLEPLAY_MAX_TOKENS_PER_TURN: u32 = 96;
+pub const VISUAL_MAX_TOKENS: u32 = 60_000;
+pub const AGENT_TASK_MAX_TOKENS: u32 = 4_096;
+pub const ROLEPLAY_MAX_TOKENS_PER_TURN: u32 = 1_024;
 pub const SEED: u64 = 42;
 
 const PELICAN_PROMPT: &str = "Generate an SVG of a pelican riding a bicycle";
 const BREAKOUT_PROMPT: &str = "Can you make a simple breakout game in HTML?";
-const MAX_OUTPUT_CHARS: usize = 131_072;
-const MAX_EVIDENCE_CHARS: usize = 4_000;
+const MAX_OUTPUT_CHARS: usize = 2_000_000;
+const MAX_AGENT_EVIDENCE_CHARS: usize = 262_144;
+const MAX_ROLEPLAY_ANSWER_CHARS: usize = 65_536;
+const STANDARD_CHAT_TIMEOUT_SECS: u64 = 7_200;
+const VISUAL_CHAT_TIMEOUT_SECS: u64 = 86_000;
 const CONTROLLED_SERVER_FLAGS: &[&str] = &[
     "-m",
     "--model",
@@ -90,12 +93,14 @@ pub struct EvaluationOpts<'a> {
     pub model: &'a str,
     pub port: u16,
     pub api_key: &'a str,
-    pub context_length: u32,
+    /// None asks llama.cpp to fit its model-native context to the hardware.
+    pub context_length: Option<u32>,
     pub runtime_args: Vec<String>,
 }
 
 pub struct RuntimeConfig {
     pub args: Vec<String>,
+    pub parallel: u32,
     pub kv_cache_key: String,
     pub kv_cache_value: String,
     pub flash_attention: String,
@@ -107,6 +112,7 @@ pub struct EvaluationRun {
     pub agentic_tasks: Vec<AgenticTaskResult>,
     pub roleplay: RoleplayResult,
     pub context_length: u32,
+    pub context_mode: String,
     pub runtime: RuntimeConfig,
 }
 
@@ -144,11 +150,25 @@ pub fn settings() -> EvaluationSettings {
     }
 }
 
+fn evaluation_server_args(
+    context_length: Option<u32>,
+    runtime_args: &[String],
+) -> Result<Vec<String>> {
+    if context_length.is_none() && runtime_conflicts_with_auto_fit(runtime_args) {
+        bail!("automatic context selection requires unambiguous llama.cpp parameter fitting; use an enabled `-fit=VALUE` or `--fit=VALUE` form, or pass an explicit --context-length");
+    }
+    let mut server_args = Vec::new();
+    if let Some(context_length) = context_length {
+        server_args.extend(["-c".to_string(), context_length.to_string()]);
+    }
+    server_args.extend(runtime_args.iter().cloned());
+    Ok(server_args)
+}
+
 pub fn run_eval(opts: &EvaluationOpts) -> Result<EvaluationRun> {
     ensure_explicit_runtime_environment()?;
     let runtime = runtime_config(&opts.runtime_args)?;
-    let mut server_args = vec!["-c".to_string(), opts.context_length.to_string()];
-    server_args.extend(opts.runtime_args.clone());
+    let server_args = evaluation_server_args(opts.context_length, &opts.runtime_args)?;
     let verify_opts = VerifyOpts {
         server_bin_dir: opts.server_bin_dir,
         model: opts.model,
@@ -162,24 +182,21 @@ pub fn run_eval(opts: &EvaluationOpts) -> Result<EvaluationRun> {
     };
     let _guard = verify::spawn_server(&verify_opts)?;
     let context_length = server_context(opts.port, Some(opts.api_key))?;
+    let context_mode = if opts.context_length.is_some() {
+        "fixed"
+    } else {
+        eprintln!(
+            "  ✓ llama.cpp fit the effective context to {} tokens",
+            context_length
+        );
+        "auto-fit"
+    };
 
     eprintln!("\n▸ [1/5] Visual — pelican SVG (≤ {VISUAL_MAX_TOKENS} generated tokens)");
-    let pelican_svg = run_visual(
-        opts,
-        "pelican-svg-v1",
-        "Return only one compact, self-contained SVG document under 700 generated tokens. Start with <svg and end with </svg>. Use viewBox=\"0 0 800 600\", simple shapes, flat colors, and at most 20 vector elements; prefer circles, ellipses, lines, polygons, and short paths. Do not use comments, text explanations, markdown fences, scripts, styles, foreignObject, images, links, embedded files, or external resources. If nearing the token limit, close every open element and the SVG immediately.",
-        PELICAN_PROMPT,
-        false,
-    )?;
+    let pelican_svg = run_visual(opts, "pelican-svg-v2", PELICAN_PROMPT, false)?;
 
     eprintln!("\n▸ [2/5] Visual — breakout HTML (≤ {VISUAL_MAX_TOKENS} generated tokens)");
-    let breakout_html = run_visual(
-        opts,
-        "breakout-html-v1",
-        "Return only one self-contained HTML document with inline CSS and JavaScript. Build a visible ball, paddle, and bricks; include keyboard controls, collision handling, scoring, and a game loop. Do not use markdown fences, network requests, links, imports, or external resources.",
-        BREAKOUT_PROMPT,
-        true,
-    )?;
+    let breakout_html = run_visual(opts, "breakout-html-v2", BREAKOUT_PROMPT, true)?;
 
     eprintln!("\n▸ [3/5] Agentic — discover a value through the virtual filesystem");
     let discovery = run_agent_task(opts, DiscoveryHarness::default())?;
@@ -206,6 +223,7 @@ pub fn run_eval(opts: &EvaluationOpts) -> Result<EvaluationRun> {
         agentic_tasks: vec![discovery, repair],
         roleplay,
         context_length,
+        context_mode: context_mode.to_string(),
         runtime,
     })
 }
@@ -238,6 +256,34 @@ fn last_runtime_value(args: &[String], names: &[&str]) -> Option<String> {
         index += 1;
     }
     value
+}
+
+fn runtime_conflicts_with_auto_fit(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        if matches!(arg.as_str(), "-fit" | "--fit") || runtime_flag(arg) == "--no-fit" {
+            return true;
+        }
+        arg.split_once('=').is_some_and(|(flag, value)| {
+            matches!(flag, "-fit" | "--fit")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "disabled"
+                )
+        })
+    })
+}
+
+fn runtime_parallel(args: &[String]) -> Result<u32> {
+    let Some(value) = last_runtime_value(args, &["-np", "--parallel"]) else {
+        return Ok(1);
+    };
+    let Ok(parallel) = value.parse::<u32>() else {
+        bail!("eval-v2 requires -np/--parallel to be a positive integer");
+    };
+    if parallel == 0 {
+        bail!("eval-v2 requires -np/--parallel to be a positive integer");
+    }
+    Ok(parallel)
 }
 
 fn canonical_runtime_flags(args: &[String], predicate: impl Fn(&str) -> bool) -> Vec<String> {
@@ -341,7 +387,7 @@ fn exact_runtime_args(args: &[String]) -> Result<Vec<String>> {
         let value = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
         if looks_like_absolute_path(value) {
             bail!(
-                "eval-v1 cannot publish absolute native argument value {value:?} without losing exact identity; use a relative value or remove that option"
+                "eval-v2 cannot publish absolute native argument value {value:?} without losing exact identity; use a relative value or remove that option"
             );
         }
     }
@@ -350,12 +396,17 @@ fn exact_runtime_args(args: &[String]) -> Result<Vec<String>> {
 
 pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
     if args.len() > 256 {
-        bail!("eval-v1 accepts at most 256 native arguments");
+        bail!("eval-v2 accepts at most 256 native arguments");
     }
     for arg in args {
         let length = arg.chars().count();
-        if length == 0 || length > 2_000 {
-            bail!("each eval-v1 native argument must contain 1..=2000 characters");
+        if length == 0
+            || length > 2_000
+            || arg
+                .chars()
+                .any(|value| value.is_control() || matches!(value, '\u{2028}' | '\u{2029}'))
+        {
+            bail!("each eval-v2 native argument must contain 1..=2000 characters and no control characters");
         }
         let flag = runtime_flag(arg);
         if CONTROLLED_SERVER_FLAGS.contains(&flag) || is_model_preset_flag(flag) {
@@ -364,7 +415,7 @@ pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
             );
         }
         if UNTRACKED_ARTIFACT_FLAGS.contains(&flag) {
-            bail!("{flag} supplies an auxiliary artifact that eval-v1 cannot hash and represent");
+            bail!("{flag} supplies an auxiliary artifact that eval-v2 cannot hash and represent");
         }
     }
     let kv_cache_key = last_runtime_value(args, &["-ctk", "--cache-type-k"])
@@ -386,12 +437,14 @@ pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
     .to_string();
     let mode = speculative_mode(args);
     let exact_args = exact_runtime_args(args)?;
+    let parallel = runtime_parallel(&exact_args)?;
     let parameters = canonical_runtime_flags(&exact_args, is_spec_parameter_flag);
     if parameters.len() > 64 || parameters.iter().any(|value| value.chars().count() > 500) {
-        bail!("eval-v1 accepts at most 64 speculative overrides of at most 500 characters each");
+        bail!("eval-v2 accepts at most 64 speculative overrides of at most 500 characters each");
     }
     Ok(RuntimeConfig {
         args: exact_args,
+        parallel,
         kv_cache_key,
         kv_cache_value,
         flash_attention,
@@ -402,16 +455,18 @@ pub fn runtime_config(args: &[String]) -> Result<RuntimeConfig> {
 fn run_visual(
     opts: &EvaluationOpts,
     prompt_id: &str,
-    system: &str,
     prompt: &str,
     breakout: bool,
 ) -> Result<VisualArtifact> {
     let start = Instant::now();
-    let messages = vec![
-        json!({"role": "system", "content": system}),
-        json!({"role": "user", "content": prompt}),
-    ];
-    let reply = chat(opts, &messages, None, VISUAL_MAX_TOKENS)?;
+    let messages = visual_messages(prompt);
+    let reply = chat(
+        opts,
+        &messages,
+        None,
+        VISUAL_MAX_TOKENS,
+        VISUAL_CHAT_TIMEOUT_SECS,
+    )?;
     let raw = reply.visible_output();
     let output = if breakout {
         extract_html(&raw).unwrap_or_else(|| bounded(&raw, MAX_OUTPUT_CHARS))
@@ -423,14 +478,27 @@ fn run_visual(
     } else {
         Vec::new()
     };
+    let generated_tokens = visual_generated_tokens(&output, reply.generated_tokens)?;
     Ok(VisualArtifact {
         prompt_id: prompt_id.to_string(),
         output_sha256: sha256_hex(&output),
         output,
         duration_ms: elapsed_ms(start),
-        generated_tokens: reply.generated_tokens.min(VISUAL_MAX_TOKENS),
+        generated_tokens,
         checks,
     })
+}
+
+fn visual_generated_tokens(output: &str, generated_tokens: u32) -> Result<u32> {
+    let generated_tokens = generated_tokens.min(VISUAL_MAX_TOKENS);
+    if output.is_empty() && generated_tokens != 0 {
+        bail!("llama-server reported generated tokens for an empty visual response");
+    }
+    Ok(generated_tokens)
+}
+
+fn visual_messages(prompt: &str) -> Vec<Value> {
+    vec![json!({"role": "user", "content": prompt})]
 }
 
 fn chat(
@@ -438,6 +506,7 @@ fn chat(
     messages: &[Value],
     tools: Option<&Value>,
     max_tokens: u32,
+    timeout_secs: u64,
 ) -> Result<ChatReply> {
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", opts.port);
     let mut body = json!({
@@ -452,7 +521,7 @@ fn chat(
         body["tool_choice"] = json!("auto");
     }
     let resp = ureq::post(&url)
-        .timeout(Duration::from_secs(1_500))
+        .timeout(Duration::from_secs(timeout_secs))
         .set("Authorization", &format!("Bearer {}", opts.api_key))
         .send_json(body)
         .map_err(|e| anyhow::anyhow!("eval chat request failed: {e}"))?;
@@ -508,7 +577,13 @@ fn run_agent_task<H: AgentHarness>(
             failure = Some("generation token ceiling reached before completion".to_string());
             break;
         }
-        let reply = match chat(opts, &messages, Some(&tools), remaining.min(96)) {
+        let reply = match chat(
+            opts,
+            &messages,
+            Some(&tools),
+            remaining,
+            STANDARD_CHAT_TIMEOUT_SECS,
+        ) {
             Ok(reply) => reply,
             Err(e) => {
                 failure = Some(format!("engine error: {e}"));
@@ -519,7 +594,7 @@ fn run_agent_task<H: AgentHarness>(
         let requested = requested_tools(&reply.message);
         messages.push(reply.message.clone());
         if requested.is_empty() {
-            final_output = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
+            final_output = bounded(&reply.visible_output(), MAX_AGENT_EVIDENCE_CHARS);
             break;
         }
         for call in requested {
@@ -776,9 +851,15 @@ fn run_roleplay(opts: &EvaluationOpts) -> Result<RoleplayResult> {
     let mut turns = Vec::new();
     for (id, question) in questions {
         messages.push(json!({"role": "user", "content": question}));
-        let reply = chat(opts, &messages, None, ROLEPLAY_MAX_TOKENS_PER_TURN)?;
+        let reply = chat(
+            opts,
+            &messages,
+            None,
+            ROLEPLAY_MAX_TOKENS_PER_TURN,
+            STANDARD_CHAT_TIMEOUT_SECS,
+        )?;
         let turn_tokens = reply.generated_tokens.min(ROLEPLAY_MAX_TOKENS_PER_TURN);
-        let answer = bounded(&reply.visible_output(), MAX_EVIDENCE_CHARS);
+        let answer = bounded(&reply.visible_output(), MAX_ROLEPLAY_ANSWER_CHARS);
         messages.push(json!({"role": "assistant", "content": answer}));
         turns.push(RoleplayTurn {
             question_id: id.to_string(),
@@ -1295,9 +1376,63 @@ mod tests {
         let s = settings();
         assert_eq!(s.seed, 42);
         assert_eq!(s.temperature, 0.0);
-        assert_eq!(s.visual_max_tokens, 1024);
-        assert_eq!(s.agent_task_max_tokens, 256);
-        assert_eq!(s.roleplay_max_tokens_per_turn, 96);
+        assert_eq!(s.visual_max_tokens, 60_000);
+        assert_eq!(s.agent_task_max_tokens, 4_096);
+        assert_eq!(s.roleplay_max_tokens_per_turn, 1_024);
+    }
+
+    #[test]
+    fn automatic_context_omits_ctx_flag_and_requires_fit() {
+        let runtime = vec!["-ngl".to_string(), "999".to_string()];
+        assert_eq!(
+            evaluation_server_args(None, &runtime).unwrap(),
+            vec!["-ngl", "999"]
+        );
+        assert_eq!(
+            evaluation_server_args(Some(262_144), &runtime).unwrap(),
+            vec!["-c", "262144", "-ngl", "999"]
+        );
+        for disabled in [
+            vec!["-fit".to_string(), "off".to_string()],
+            vec!["-fit=0".to_string()],
+            vec!["-fit=FALSE".to_string()],
+            vec!["--fit".to_string(), "off".to_string()],
+            vec!["--fit=0".to_string()],
+            vec!["--fit=FALSE".to_string()],
+            vec!["--no-fit".to_string()],
+        ] {
+            assert!(evaluation_server_args(None, &disabled).is_err());
+            assert!(evaluation_server_args(Some(8192), &disabled).is_ok());
+        }
+        for spelling in ["-fit", "--fit"] {
+            assert!(
+                evaluation_server_args(None, &[spelling.to_string(), "on".to_string()]).is_err()
+            );
+            let inline = format!("{spelling}=on");
+            assert_eq!(
+                evaluation_server_args(None, std::slice::from_ref(&inline)).unwrap(),
+                vec![inline]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_visuals_require_zero_generated_tokens() {
+        assert_eq!(visual_generated_tokens("", 0).unwrap(), 0);
+        assert!(visual_generated_tokens("", 1).is_err());
+        assert_eq!(visual_generated_tokens("<svg />", 12).unwrap(), 12);
+    }
+
+    #[test]
+    fn visual_tasks_send_only_the_published_user_prompt() {
+        assert_eq!(
+            visual_messages(PELICAN_PROMPT),
+            vec![json!({"role": "user", "content": PELICAN_PROMPT})]
+        );
+        assert_eq!(
+            visual_messages(BREAKOUT_PROMPT),
+            vec![json!({"role": "user", "content": BREAKOUT_PROMPT})]
+        );
     }
 
     #[test]
@@ -1422,7 +1557,38 @@ mod tests {
         assert!(runtime_config(&vec!["--verbose".to_string(); 257]).is_err());
         assert!(runtime_config(&[String::new()]).is_err());
         assert!(runtime_config(&[format!("--chat-template={}", "x".repeat(2_001))]).is_err());
+        assert!(runtime_config(&["value\n--api-key=secret".to_string()]).is_err());
         assert!(runtime_config(&[format!("--spec-custom={}", "x".repeat(501))]).is_err());
+        for invalid_parallel in [
+            vec!["-np".to_string(), "0".to_string()],
+            vec!["--parallel=none".to_string()],
+        ] {
+            assert!(runtime_config(&invalid_parallel).is_err());
+        }
+        assert_eq!(
+            runtime_config(&[
+                "-np".to_string(),
+                "2".to_string(),
+                "--parallel=4".to_string(),
+            ])
+            .unwrap()
+            .parallel,
+            4
+        );
+    }
+
+    #[test]
+    fn evidence_bounds_preserve_the_disclosed_token_budgets() {
+        let agent = bounded(
+            &"x".repeat(MAX_AGENT_EVIDENCE_CHARS + 1),
+            MAX_AGENT_EVIDENCE_CHARS,
+        );
+        let roleplay = bounded(
+            &"x".repeat(MAX_ROLEPLAY_ANSWER_CHARS + 1),
+            MAX_ROLEPLAY_ANSWER_CHARS,
+        );
+        assert_eq!(agent.chars().count(), 262_144);
+        assert_eq!(roleplay.chars().count(), 65_536);
     }
 
     #[test]

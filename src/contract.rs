@@ -141,10 +141,11 @@ pub struct Submitter {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in exact-configuration behavior evaluation (ADR-014).
+// Opt-in exact-configuration behavior evaluation (ADR-014 / ADR-016).
 // ---------------------------------------------------------------------------
 
-pub const EVAL_VERSION: &str = "eval-v1";
+pub const EVAL_SCHEMA_VERSION: u32 = 2;
+pub const EVAL_VERSION: &str = "eval-v2";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EvaluationSettings {
@@ -246,6 +247,8 @@ pub struct EvaluationModel {
     pub hf_model: Option<String>,
     #[serde(rename = "hfVerified", skip_serializing_if = "Option::is_none")]
     pub hf_verified: Option<bool>,
+    #[serde(rename = "ggufFile")]
+    pub gguf_file: String,
     #[serde(rename = "ggufSha256")]
     pub gguf_sha256: String,
 }
@@ -255,6 +258,8 @@ pub struct EvaluationConfig {
     pub quant: String,
     #[serde(rename = "contextLength")]
     pub context_length: u32,
+    #[serde(rename = "contextMode")]
+    pub context_mode: String,
     #[serde(rename = "kvCacheKey")]
     pub kv_cache_key: String,
     #[serde(rename = "kvCacheValue")]
@@ -265,6 +270,9 @@ pub struct EvaluationConfig {
     pub speculative_decoding: SpeculativeDecodingConfig,
     #[serde(rename = "runtimeArgs")]
     pub runtime_args: Vec<String>,
+    /// Local display only. Eval-v2 omits this from the signed wire payload so the
+    /// server can derive the public command from the validated structured fields.
+    #[serde(skip)]
     pub command: String,
 }
 
@@ -366,6 +374,7 @@ mod tests {
         let config = EvaluationConfig {
             quant: "Q4_K_M".to_string(),
             context_length: 8192,
+            context_mode: "auto-fit".to_string(),
             kv_cache_key: "q4_0".to_string(),
             kv_cache_value: "q4_0".to_string(),
             flash_attention: "auto".to_string(),
@@ -383,10 +392,28 @@ mod tests {
         };
         let json = serde_json::to_value(config).unwrap();
         assert_eq!(json["contextLength"], 8192);
+        assert_eq!(json["contextMode"], "auto-fit");
         assert_eq!(json["kvCacheKey"], "q4_0");
         assert_eq!(json["kvCacheValue"], "q4_0");
         assert_eq!(json["flashAttention"], "auto");
         assert_eq!(json["speculativeDecoding"]["mode"], "draft-mtp");
         assert_eq!(json["runtimeArgs"][0], "-ctk");
+        assert!(json.get("command").is_none());
+    }
+
+    #[test]
+    fn evaluation_model_serializes_the_reproduce_basename() {
+        let model = EvaluationModel {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            params: 8.0,
+            base_model: None,
+            hf_model: None,
+            hf_verified: None,
+            gguf_file: "model-Q4_K_M.gguf".to_string(),
+            gguf_sha256: "ab".repeat(32),
+        };
+        let json = serde_json::to_value(model).unwrap();
+        assert_eq!(json["ggufFile"], "model-Q4_K_M.gguf");
     }
 }
