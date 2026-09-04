@@ -24,6 +24,13 @@ pub const VISUAL_MAX_TOKENS: u32 = 60_000;
 pub const AGENT_TASK_MAX_TOKENS: u32 = 4_096;
 pub const ROLEPLAY_MAX_TOKENS_PER_TURN: u32 = 1_024;
 pub const SEED: u64 = 42;
+pub const TEMPERATURE: f64 = 1.0;
+pub const TOP_K: u32 = 20;
+pub const TOP_P: f64 = 0.95;
+pub const MIN_P: f64 = 0.0;
+pub const PRESENCE_PENALTY: f64 = 0.0;
+pub const FREQUENCY_PENALTY: f64 = 0.0;
+pub const REPEAT_PENALTY: f64 = 1.0;
 
 const PELICAN_PROMPT: &str = "Generate an SVG of a pelican riding a bicycle";
 const BREAKOUT_PROMPT: &str = "Can you make a simple breakout game in HTML?";
@@ -143,7 +150,13 @@ struct RequestedTool {
 pub fn settings() -> EvaluationSettings {
     EvaluationSettings {
         seed: SEED,
-        temperature: 0.0,
+        temperature: TEMPERATURE,
+        top_k: TOP_K,
+        top_p: TOP_P,
+        min_p: MIN_P,
+        presence_penalty: PRESENCE_PENALTY,
+        frequency_penalty: FREQUENCY_PENALTY,
+        repeat_penalty: REPEAT_PENALTY,
         visual_max_tokens: VISUAL_MAX_TOKENS,
         agent_task_max_tokens: AGENT_TASK_MAX_TOKENS,
         roleplay_max_tokens_per_turn: ROLEPLAY_MAX_TOKENS_PER_TURN,
@@ -501,6 +514,27 @@ fn visual_messages(prompt: &str) -> Vec<Value> {
     vec![json!({"role": "user", "content": prompt})]
 }
 
+fn chat_request_body(messages: &[Value], tools: Option<&Value>, max_tokens: u32) -> Value {
+    let mut body = json!({
+        "messages": messages,
+        "seed": SEED,
+        "temperature": TEMPERATURE,
+        "top_k": TOP_K,
+        "top_p": TOP_P,
+        "min_p": MIN_P,
+        "presence_penalty": PRESENCE_PENALTY,
+        "frequency_penalty": FREQUENCY_PENALTY,
+        "repeat_penalty": REPEAT_PENALTY,
+        "max_tokens": max_tokens,
+        "stream": false,
+    });
+    if let Some(tools) = tools {
+        body["tools"] = tools.clone();
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
 fn chat(
     opts: &EvaluationOpts,
     messages: &[Value],
@@ -509,17 +543,7 @@ fn chat(
     timeout_secs: u64,
 ) -> Result<ChatReply> {
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", opts.port);
-    let mut body = json!({
-        "messages": messages,
-        "seed": SEED,
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-        "stream": false,
-    });
-    if let Some(tools) = tools {
-        body["tools"] = tools.clone();
-        body["tool_choice"] = json!("auto");
-    }
+    let body = chat_request_body(messages, tools, max_tokens);
     let resp = ureq::post(&url)
         .timeout(Duration::from_secs(timeout_secs))
         .set("Authorization", &format!("Bearer {}", opts.api_key))
@@ -1375,10 +1399,44 @@ mod tests {
     fn settings_match_the_versioned_contract() {
         let s = settings();
         assert_eq!(s.seed, 42);
-        assert_eq!(s.temperature, 0.0);
+        assert_eq!(s.temperature, TEMPERATURE);
+        assert_eq!(s.top_k, TOP_K);
+        assert_eq!(s.top_p, TOP_P);
+        assert_eq!(s.min_p, MIN_P);
+        assert_eq!(s.presence_penalty, PRESENCE_PENALTY);
+        assert_eq!(s.frequency_penalty, FREQUENCY_PENALTY);
+        assert_eq!(s.repeat_penalty, REPEAT_PENALTY);
         assert_eq!(s.visual_max_tokens, 60_000);
         assert_eq!(s.agent_task_max_tokens, 4_096);
         assert_eq!(s.roleplay_max_tokens_per_turn, 1_024);
+
+        let value = serde_json::to_value(&s).unwrap();
+        assert_eq!(value["topK"], json!(TOP_K));
+        assert_eq!(value["topP"], json!(TOP_P));
+        assert_eq!(value["minP"], json!(MIN_P));
+        assert_eq!(value["presencePenalty"], json!(PRESENCE_PENALTY));
+        assert_eq!(value["frequencyPenalty"], json!(FREQUENCY_PENALTY));
+        assert_eq!(value["repeatPenalty"], json!(REPEAT_PENALTY));
+        assert!(value.get("top_k").is_none());
+    }
+
+    #[test]
+    fn chat_request_uses_the_disclosed_sampling_profile() {
+        let messages = visual_messages(PELICAN_PROMPT);
+        let body = chat_request_body(&messages, None, VISUAL_MAX_TOKENS);
+
+        assert_eq!(body["seed"], json!(SEED));
+        assert_eq!(body["temperature"], json!(TEMPERATURE));
+        assert_eq!(body["top_k"], json!(TOP_K));
+        assert_eq!(body["top_p"], json!(TOP_P));
+        assert_eq!(body["min_p"], json!(MIN_P));
+        assert_eq!(body["presence_penalty"], json!(PRESENCE_PENALTY));
+        assert_eq!(body["frequency_penalty"], json!(FREQUENCY_PENALTY));
+        assert_eq!(body["repeat_penalty"], json!(REPEAT_PENALTY));
+        assert_eq!(body["max_tokens"], json!(VISUAL_MAX_TOKENS));
+        assert_eq!(body["stream"], json!(false));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]

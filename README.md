@@ -141,13 +141,15 @@ string in `eval`; normal shell quoting determines the native argument vector.
 The versioned evaluation starts `llama-server` once and runs five bounded
 scenarios: a pelican-on-a-bicycle SVG, a self-contained Breakout game, two
 deterministic virtual-workspace tool-use tasks, and a three-turn Phileas Fogg
-role-play. Eval v2 uses temperature 0 and seed 42, sends the two published visual
-prompts without a hidden system prompt, and allows up to 60,000 generated tokens
-for each visual task, 4,096 for each agent task, and 1,024 for each role-play
-turn. A visual request may take up to 24 hours, each agent final response retains
-up to 262,144 characters, and each role-play answer retains up to 65,536
-characters. The runner does not force a reasoning mode; a native reasoning flag
-is recorded only if the user explicitly supplies it. Use `--dry-run` to inspect
+role-play. Eval v2 uses seed 42 with a fixed sampled profile (temperature 1,
+top-k 20, top-p 0.95, min-p 0, presence/frequency penalties 0, and repeat penalty
+1), sends the two published visual prompts without a hidden system prompt, and
+allows up to 60,000 generated tokens for each visual task, 4,096 for each agent
+task, and 1,024 for each role-play turn. A visual request may take up to 24 hours,
+each agent final response retains up to 262,144 characters, and each role-play
+answer retains up to 65,536 characters. The runner does not force a reasoning
+mode; a native reasoning flag is recorded only if the user explicitly supplies
+it. Use `--dry-run` to inspect
 the complete signed JSON without submitting.
 
 Every evaluation is tied to the GGUF SHA-256, backend build, effective context,
