@@ -80,15 +80,31 @@ fn nvidia_smi_group(
         None | Some("") | Some("all") => gpus.iter().collect(),
         Some("-1") => Vec::new(),
         Some(value) => {
+            let identities: Vec<_> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .collect();
+            if identities.iter().any(|identity| {
+                !identity.to_ascii_uppercase().starts_with("GPU-")
+                    && !identity.to_ascii_uppercase().starts_with("MIG-")
+            }) {
+                // Numeric CUDA ordinals expose cardinality but are not guaranteed
+                // to match nvidia-smi row order. Preserve the number of devices in
+                // hardware identity without inventing their aggregate capacity.
+                let mut unique = Vec::new();
+                for identity in identities {
+                    if !unique.contains(&identity) {
+                        unique.push(identity);
+                    }
+                }
+                return (!unique.is_empty()).then_some((unique.len(), 0));
+            }
             let mut selected = Vec::new();
-            for identity in value.split(',').map(str::trim) {
+            for identity in identities {
                 if identity.to_ascii_uppercase().starts_with("MIG-") {
                     return None;
                 }
-                // Numeric CUDA ordinals follow CUDA's enumeration order, which is
-                // not guaranteed to match nvidia-smi's row order. Without a CUDA
-                // runtime identity query, conservatively skip grouping rather than
-                // attribute the wrong physical cards or VRAM capacities.
                 let gpu = unique_by_identity(&gpus, identity, |gpu| &gpu.uuid)?;
                 if !selected.contains(&gpu) {
                     selected.push(gpu);
@@ -479,7 +495,10 @@ mod tests {
             nvidia_smi_group(output, "CMP 170HX", Some("GPU-bbbb")),
             Some((1, 64))
         );
-        assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("1,2")), None);
+        assert_eq!(
+            nvidia_smi_group(output, "CMP 170HX", Some("1,2")),
+            Some((2, 0))
+        );
         assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), None);
         assert_eq!(
             nvidia_smi_group(output, "NVIDIA H100", Some("GPU-cccc")),

@@ -136,9 +136,10 @@ pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Res
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     };
-    let valid = base_model
-        .split_once('/')
-        .is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name));
+    let valid = base_model.len() <= 96
+        && base_model
+            .split_once('/')
+            .is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name));
     if !valid {
         bail!("--base-model must be a Hugging Face repo in owner/name form");
     }
@@ -705,6 +706,13 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+        let too_long = format!("{}/{}", "o".repeat(48), "m".repeat(48));
+        let hf = HfProvenance {
+            model: Some("publisher/quantized".to_string()),
+            verified: Some(true),
+            canonical: Canonical::default(),
+        };
+        assert!(explicit_canonical(hf, Some(&too_long)).is_err());
     }
 
     #[test]
