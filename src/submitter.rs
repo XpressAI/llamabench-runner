@@ -20,6 +20,17 @@ use crate::link;
 pub const DEFAULT_API: &str = "https://llamabench.ai/api/results";
 pub const DEFAULT_EVAL_API: &str = "https://llamabench.ai/api/evals";
 
+pub fn positive_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| "must be a number".to_string())?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("must be a finite number greater than zero".to_string())
+    }
+}
+
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
 /// recorded under the variant's name so they stay comparable yet distinct.
@@ -67,7 +78,7 @@ impl Family {
 /// quantizes). Lets every GGUF repack of the same model group together. All fields are
 /// `None` when there's no HF repo or no resolvable `base_model`, in which case the
 /// caller falls back to the per-quant llama-bench label.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Canonical {
     /// The full canonical HF repo, e.g. `google/gemma-4-12b-it`. → `ModelInfo.base_model`.
     pub base_model: Option<String>,
@@ -105,10 +116,62 @@ pub fn resolve_canonical(repo: &str) -> Canonical {
     }
 }
 
+/// Apply an explicit canonical HF model when the GGUF repository does not publish
+/// `cardData.base_model`. The source GGUF repository must still be present in the
+/// provenance; this flag changes grouping identity, never artifact attribution.
+pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Result<HfProvenance> {
+    let Some(base_model) = base_model else {
+        return Ok(hf);
+    };
+    let base_model = base_model.trim();
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment.len() <= 96
+            && !segment.starts_with(['-', '.'])
+            && !segment.ends_with(['-', '.'])
+            && !segment.contains("--")
+            && !segment.contains("..")
+            && !segment.ends_with(".git")
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    let valid = base_model.len() <= 96
+        && base_model
+            .split_once('/')
+            .is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name));
+    if !valid {
+        bail!("--base-model must be a Hugging Face repo in owner/name form");
+    }
+    if hf.model.is_none() {
+        bail!("--base-model requires Hugging Face GGUF provenance (link the local file first, or pass --hf-model)");
+    }
+    if let Some(authoritative) = hf.canonical.base_model.as_deref() {
+        if !authoritative.eq_ignore_ascii_case(base_model) {
+            bail!(
+                "--base-model {base_model} conflicts with repository metadata base_model {authoritative}"
+            );
+        }
+        return Ok(hf);
+    }
+    let (id, name) = canonical_id_name(base_model);
+    eprintln!(
+        "→ model: {name} (explicit base of {})",
+        hf.model.as_deref().unwrap_or("GGUF")
+    );
+    hf.canonical = Canonical {
+        base_model: Some(base_model.to_string()),
+        id: Some(id),
+        name: Some(name),
+    };
+    Ok(hf)
+}
+
 /// Hugging Face provenance recorded on the model: the source repo, whether the bytes
 /// are confirmed to come from it, and the canonical (base/finetune) model identity it
 /// should be attributed to. Maps to `ModelInfo.hf_model` / `hf_verified` / `base_model`
 /// (and the canonical `id`/`name`).
+#[derive(Clone)]
 pub struct HfProvenance {
     pub model: Option<String>,
     pub verified: Option<bool>,
@@ -298,15 +361,34 @@ pub struct BuildCtx<'a> {
     /// Explicit llama.cpp device selector (`CUDA1`, UUID, etc.), when supplied. This
     /// keeps per-device properties tied to the GPU that actually ran the benchmark.
     pub selected_device: Option<String>,
+    /// Whether the native configuration distributes work across visible GPUs.
+    /// `--split-mode none` explicitly disables this even when several cards are visible.
+    pub group_visible_gpus: bool,
     pub handle: &'a str,
     pub family: Family,
     /// The exact reproduce command recorded on the result (paths/keys already redacted).
     pub command: String,
     pub quant: &'a str,
     pub model_path: &'a str,
+    pub active_params: Option<f64>,
     pub context_length: u32,
     pub spec_decode: String,
     pub ttft_ms: Option<u32>,
+}
+
+pub(crate) fn validate_active_params(active_params: Option<f64>, total_params: f64) -> Result<()> {
+    let Some(active) = active_params else {
+        return Ok(());
+    };
+    if !active.is_finite() || active <= 0.0 {
+        bail!("active parameters must be a finite number greater than zero");
+    }
+    if total_params.is_finite() && total_params > 0.0 && active > total_params {
+        bail!(
+            "active parameters ({active}B) cannot exceed measured total parameters ({total_params:.3}B)"
+        );
+    }
+    Ok(())
 }
 
 pub fn build_submission(
@@ -314,10 +396,11 @@ pub fn build_submission(
     b: &BenchResult,
     v: Option<Verification>,
     hf: HfProvenance,
-) -> ResultSubmission {
+) -> Result<ResultSubmission> {
+    validate_active_params(ctx.active_params, b.params_b)?;
     // On Apple Silicon the GPU is the chip, and the Metal banner reads noisily as
     // "MTL0 (Apple M4)"; sysctl gives the clean canonical name, so prefer it for GPU runs.
-    let device = ctx
+    let mut device = ctx
         .gpu_run
         .then(detect::apple_chip)
         .flatten()
@@ -359,12 +442,29 @@ pub fn build_submission(
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
     } else if vendor == "NVIDIA" {
-        detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
-            .map_or(0.0, |gib| gib as f64)
+        if let Some((count, total_gib, homogeneous)) = ctx
+            .group_visible_gpus
+            .then(|| {
+                detect::nvidia_gpu_group(&device, ctx.selected_device.as_deref(), &b.backend_label)
+            })
+            .flatten()
+        {
+            if count > 1 {
+                device = if homogeneous {
+                    format!("{count}× {device}")
+                } else {
+                    format!("{count}× mixed NVIDIA GPUs")
+                };
+            }
+            total_gib as f64
+        } else {
+            detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
+                .map_or(0.0, |gib| gib as f64)
+        }
     } else {
         0.0
     };
-    ResultSubmission {
+    Ok(ResultSubmission {
         schema_version: SCHEMA_VERSION,
         hardware: Hardware {
             id: detect::slugify(&device),
@@ -379,6 +479,7 @@ pub fn build_submission(
             id: model_id,
             name,
             params: b.params_b,
+            active_params: ctx.active_params,
             base_model,
             hf_model,
             hf_verified,
@@ -410,7 +511,7 @@ pub fn build_submission(
             handle: ctx.handle.to_string(),
         },
         signature: String::new(),
-    }
+    })
 }
 
 pub fn emit(s: &ResultSubmission) -> Result<()> {
@@ -554,6 +655,72 @@ mod tests {
     }
 
     #[test]
+    fn explicit_canonical_requires_repo_provenance() {
+        let err = explicit_canonical(HfProvenance::none(), Some("ornith-ai/Ornith-1.5-9B"))
+            .err()
+            .expect("missing GGUF provenance must fail");
+        assert!(err
+            .to_string()
+            .contains("requires Hugging Face GGUF provenance"));
+
+        let hf = HfProvenance {
+            model: Some("ornith-ai/Ornith-1.5-9B-GGUF".to_string()),
+            verified: Some(true),
+            canonical: Canonical::default(),
+        };
+        let resolved = explicit_canonical(hf, Some("ornith-ai/Ornith-1.5-9B")).unwrap();
+        assert_eq!(resolved.canonical.id.as_deref(), Some("ornith-1-5-9b"));
+        assert_eq!(resolved.canonical.name.as_deref(), Some("Ornith-1.5-9B"));
+        assert_eq!(
+            resolved.canonical.base_model.as_deref(),
+            Some("ornith-ai/Ornith-1.5-9B")
+        );
+
+        let authoritative = HfProvenance {
+            model: Some("publisher/quantized".to_string()),
+            verified: Some(true),
+            canonical: Canonical {
+                base_model: Some("publisher/canonical".to_string()),
+                id: Some("canonical".to_string()),
+                name: Some("canonical".to_string()),
+            },
+        };
+        let err = explicit_canonical(authoritative, Some("attacker/unrelated"))
+            .err()
+            .expect("conflicting repository metadata must win");
+        assert!(err
+            .to_string()
+            .contains("conflicts with repository metadata"));
+
+        for invalid in [
+            "owner/.",
+            "owner/---",
+            "owner/   ",
+            "owner/bad--name",
+            "owner/bad..name",
+            "owner/name.git",
+            "owner/name/extra",
+        ] {
+            let hf = HfProvenance {
+                model: Some("publisher/quantized".to_string()),
+                verified: Some(true),
+                canonical: Canonical::default(),
+            };
+            assert!(
+                explicit_canonical(hf, Some(invalid)).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        let too_long = format!("{}/{}", "o".repeat(48), "m".repeat(48));
+        let hf = HfProvenance {
+            model: Some("publisher/quantized".to_string()),
+            verified: Some(true),
+            canonical: Canonical::default(),
+        };
+        assert!(explicit_canonical(hf, Some(&too_long)).is_err());
+    }
+
+    #[test]
     fn quant_parsing() {
         // Unsloth Dynamic "UD" prefix is preserved (it's a distinct quant recipe).
         assert_eq!(
@@ -597,5 +764,18 @@ mod tests {
         // "3.1" (version) must not be read as a size; "8B" wins.
         assert_eq!(params_from_name("Meta-Llama-3.1-8B"), 8.0);
         assert_eq!(params_from_name("mystery-model"), 0.0);
+    }
+
+    #[test]
+    fn active_params_cannot_exceed_measured_total() {
+        assert!(validate_active_params(Some(3.0), 35.0).is_ok());
+        assert!(validate_active_params(Some(40.0), 35.0)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot exceed"));
+        // Server-mode filename heuristics may not recover a total; retain the
+        // positive/finite validation but defer the upper bound when total is unknown.
+        assert!(validate_active_params(Some(3.0), 0.0).is_ok());
+        assert!(validate_active_params(Some(f64::INFINITY), 35.0).is_err());
     }
 }

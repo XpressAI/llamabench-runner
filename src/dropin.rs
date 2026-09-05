@@ -13,7 +13,8 @@
 //!   output-correctness verification against that same process.
 //!
 //! Runner-owned flags (`--dry-run`, `--no-verify`, `--token`, `--handle`,
-//! `--family`, `--llama-dir`, `--api`, `--download-llama`) are extracted before
+//! `--family`, `--llama-dir`, `--api`, `--download-llama`, `--base-model`,
+//! `--active-params`, `--verification-port`) are extracted before
 //! passthrough; none collide with llama.cpp flag names.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,6 +48,9 @@ pub struct WrapOpts {
     pub family: Family,
     pub llama_dir: String,
     pub api: String,
+    pub base_model: Option<String>,
+    pub active_params: Option<f64>,
+    pub verification_port: u16,
 }
 
 impl Default for WrapOpts {
@@ -60,6 +64,9 @@ impl Default for WrapOpts {
             family: Family::LlamaCpp,
             llama_dir: String::new(),
             api: submitter::DEFAULT_API.to_string(),
+            base_model: None,
+            active_params: None,
+            verification_port: 8080,
         }
     }
 }
@@ -112,6 +119,22 @@ fn extract_wrapper_flags(args: &[String]) -> Result<(WrapOpts, Vec<String>)> {
             "--family" => w.family = Family::parse(&take_value(args, &mut i, name, inline)?)?,
             "--llama-dir" => w.llama_dir = take_value(args, &mut i, name, inline)?,
             "--api" => w.api = take_value(args, &mut i, name, inline)?,
+            "--base-model" => w.base_model = Some(take_value(args, &mut i, name, inline)?),
+            "--active-params" => {
+                let value = take_value(args, &mut i, name, inline)?;
+                w.active_params = Some(
+                    submitter::positive_f64(&value)
+                        .map_err(|message| anyhow!("--active-params {message}"))?,
+                );
+            }
+            "--verification-port" => {
+                w.verification_port = take_value(args, &mut i, name, inline)?
+                    .parse()
+                    .map_err(|_| anyhow!("--verification-port must be a number from 1 to 65535"))?;
+                if w.verification_port == 0 {
+                    bail!("--verification-port must be a number from 1 to 65535");
+                }
+            }
             _ => rest.push(a.clone()),
         }
         i += 1;
@@ -202,6 +225,25 @@ fn flag_value(args: &[String], names: &[&str]) -> Option<String> {
 
 fn selected_device(args: &[String]) -> Option<String> {
     flag_value(args, &["-dev", "--device"]).filter(|value| !value.is_empty())
+}
+
+fn validate_selected_device_scope(selected: Option<&str>) -> Result<()> {
+    let count = selected
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter(|value| !value.trim().is_empty())
+        .count();
+    if count > 1 {
+        bail!(
+            "multiple explicit --device selectors are not supported; select one device or omit --device to record all visible CUDA devices as a group"
+        );
+    }
+    Ok(())
+}
+
+fn group_visible_gpus(args: &[String]) -> bool {
+    !flag_value(args, &["-sm", "--split-mode"])
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
 }
 
 /// Shell-quote a token if needed (for the recorded reproduce command).
@@ -521,6 +563,59 @@ fn verify_args_for(g: &Group) -> Vec<String> {
     a
 }
 
+fn validate_model_metadata_scope(
+    groups: &[Group],
+    active_params: Option<f64>,
+    base_model: Option<&str>,
+) -> Result<()> {
+    if active_params.is_none() && base_model.is_none() {
+        return Ok(());
+    }
+    let Some(first_model) = groups.first().map(|group| &group.model_file) else {
+        return Ok(());
+    };
+    if groups
+        .iter()
+        .any(|group| group.model_file.as_str() != first_model.as_str())
+    {
+        bail!(
+            "--active-params and --base-model apply to one model; split a multi-model llama-bench matrix into separate commands"
+        );
+    }
+    Ok(())
+}
+
+fn metadata_model_arg(model_arg: &str, w: &WrapOpts) -> Result<Option<String>> {
+    if w.active_params.is_none() && w.base_model.is_none() {
+        return Ok(None);
+    }
+    let mut models = Vec::new();
+    for model in model_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if models.len() != 1 {
+        bail!(
+            "--active-params and --base-model apply to one model; split a multi-model llama-bench matrix into separate commands"
+        );
+    }
+    Ok(models.first().map(|model| (*model).to_string()))
+}
+
+fn ensure_artifact_hash_unchanged(before: &str, after: &str) -> Result<()> {
+    if before != after {
+        bail!(
+            "model artifact changed while the run was in progress; refusing to submit ambiguous evidence"
+        );
+    }
+    Ok(())
+}
+
 fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     let explicit_model = flag_value(args, &["-m", "--model"]).filter(|v| !v.is_empty());
     if explicit_model.is_none() {
@@ -528,6 +623,29 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             "pass -m <model.gguf> — llamabench won't benchmark llama-bench's built-in default path"
         );
     }
+    let requested_device = selected_device(args);
+    validate_selected_device_scope(requested_device.as_deref())?;
+    let metadata_model = metadata_model_arg(explicit_model.as_deref().unwrap_or_default(), w)?;
+    let prepared_hf = if w.base_model.is_some() {
+        let model = metadata_model
+            .as_deref()
+            .context("--base-model requires one explicit model")?;
+        let quant = submitter::resolved_quant(None, model);
+        let initial_sha256 = crate::link::fresh_sha256_for(model)?;
+        Some((
+            submitter::explicit_canonical(
+                submitter::provenance_exact(
+                    &ModelSource::LocalOnly(model),
+                    &quant,
+                    &initial_sha256,
+                ),
+                w.base_model.as_deref(),
+            )?,
+            initial_sha256,
+        ))
+    } else {
+        None
+    };
     // Fail fast before a long run when there's nothing to submit with.
     let token = if w.dry_run {
         None
@@ -585,11 +703,14 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             skipped_rows: 0,
         });
     }
+    validate_model_metadata_scope(&groups, w.active_params, w.base_model.as_deref())?;
+    for group in &groups {
+        submitter::validate_active_params(w.active_params, group.bench.params_b)?;
+    }
 
     // Some banners enumerate every installed GPU rather than only the selected one.
     // Ask the exact binary for its labelled devices whenever selection is explicit,
     // or when an accelerator row did not report a device at all.
-    let requested_device = selected_device(args);
     let needs_device_list = requested_device.is_some()
         || groups
             .iter()
@@ -636,7 +757,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             match verify::run_verification_with_ttft(&VerifyOpts {
                 server_bin_dir: &dir,
                 model: &g.model_file,
-                port: 8080,
+                port: w.verification_port,
                 api_key: "llamabench",
                 seed: 42,
                 n_gen: 128,
@@ -655,21 +776,39 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             }
         };
         let quant = submitter::resolved_quant(None, &g.model_file);
-        let hf = submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant);
+        let (hf, exact_sha256) = match &prepared_hf {
+            Some((hf, initial_sha256)) => {
+                let final_sha256 = crate::link::fresh_sha256_for(&g.model_file)?;
+                ensure_artifact_hash_unchanged(initial_sha256, &final_sha256)?;
+                (hf.clone(), Some(final_sha256))
+            }
+            None => (
+                submitter::explicit_canonical(
+                    submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
+                    w.base_model.as_deref(),
+                )?,
+                None,
+            ),
+        };
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
             selected_device: requested_device.clone(),
+            group_visible_gpus: group_visible_gpus(args),
             handle: &w.handle,
             family: w.family,
             command: command.clone(),
             quant: &quant,
             model_path: &g.model_file,
+            active_params: w.active_params,
             context_length: g.context_length,
             spec_decode: "none".to_string(),
             ttft_ms,
         };
         let invalid = verification.as_ref().is_some_and(|v| !v.valid);
-        let mut s = build_submission(&ctx, &g.bench, verification, hf);
+        let mut s = build_submission(&ctx, &g.bench, verification, hf)?;
+        if let Some(sha256) = exact_sha256 {
+            s.model.gguf_sha256 = Some(sha256);
+        }
         submitter::sign(&mut s)?;
         submitter::emit(&s)?;
         if invalid {
@@ -765,6 +904,45 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     if model_path.is_none() && hf_repo_arg.is_none() {
         bail!("pass -m <model.gguf> (or -hf <repo>[:quant]) so llamabench knows what's being benchmarked");
     }
+    let requested_device = selected_device(args);
+    validate_selected_device_scope(requested_device.as_deref())?;
+    // Resolve deterministic identity/provenance failures before starting and
+    // measuring a potentially long-lived llama-server process.
+    let prepared_model = match (&model_path, &hf_repo_arg) {
+        (Some(m), _) => {
+            let quant = submitter::resolved_quant(None, m);
+            let initial_sha256 = crate::link::fresh_sha256_for(m)?;
+            let hf = submitter::explicit_canonical(
+                submitter::provenance_exact(&ModelSource::LocalOnly(m), &quant, &initial_sha256),
+                w.base_model.as_deref(),
+            )?;
+            let label = hf
+                .canonical
+                .name
+                .clone()
+                .unwrap_or_else(|| submitter::model_name(m));
+            (label, quant, hf, Some(initial_sha256))
+        }
+        (None, Some(spec)) => {
+            let (repo, tag) = match spec.split_once(':') {
+                Some((r, t)) => (r.to_string(), Some(t.to_string())),
+                None => (spec.clone(), None),
+            };
+            let label = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+            let quant = tag.unwrap_or_else(|| "unknown".to_string());
+            let hf = submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::Downloaded(&repo), &quant),
+                w.base_model.as_deref(),
+            )?;
+            let label = hf.canonical.name.clone().unwrap_or(label);
+            (label, quant, hf, None)
+        }
+        (None, None) => unreachable!("guarded above"),
+    };
+    submitter::validate_active_params(
+        w.active_params,
+        submitter::params_from_name(&prepared_model.0),
+    )?;
     let token = if w.dry_run {
         None
     } else {
@@ -842,26 +1020,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         }
     };
 
-    // Model identity: a local -m file (link-store provenance), or the server's own
-    // -hf download (repo[:quant] ⇒ trivially verified provenance).
-    let (model_label, quant, hf) = match (&model_path, &hf_repo_arg) {
-        (Some(m), _) => {
-            let quant = submitter::resolved_quant(None, m);
-            let hf = submitter::provenance(&ModelSource::LocalOnly(m), &quant);
-            (submitter::model_name(m), quant, hf)
-        }
-        (None, Some(spec)) => {
-            let (repo, tag) = match spec.split_once(':') {
-                Some((r, t)) => (r.to_string(), Some(t.to_string())),
-                None => (spec.clone(), None),
-            };
-            let label = repo.rsplit('/').next().unwrap_or(&repo).to_string();
-            let quant = tag.unwrap_or_else(|| "unknown".to_string());
-            let hf = submitter::provenance(&ModelSource::Downloaded(&repo), &quant);
-            (label, quant, hf)
-        }
-        (None, None) => unreachable!("guarded above"),
-    };
+    let (model_label, quant, hf, initial_sha256) = prepared_model;
     let context_length = server_ctx(port, api_key.as_deref())
         .or_else(|| flag_value(args, &["-c", "--ctx-size"]).and_then(|v| v.parse().ok()))
         .filter(|c| *c > 0)
@@ -886,7 +1045,6 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok());
     let gpu_run = ngl.map_or_else(|| !devices.lock().unwrap().is_empty(), |n| n != 0);
 
-    let requested_device = selected_device(args);
     let listed_devices = if gpu_run {
         bench::list_devices(&bin)
     } else {
@@ -921,20 +1079,33 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         devices: detected_devices,
     };
     let model_path_or_label = model_path.as_deref().unwrap_or(&model_label);
+    let exact_sha256 = match initial_sha256 {
+        Some(initial) => {
+            let final_sha256 = crate::link::fresh_sha256_for(model_path_or_label)?;
+            ensure_artifact_hash_unchanged(&initial, &final_sha256)?;
+            Some(final_sha256)
+        }
+        None => None,
+    };
     let ctx = BuildCtx {
         gpu_run,
         selected_device: requested_device,
+        group_visible_gpus: group_visible_gpus(args),
         handle: &w.handle,
         family: w.family,
         command: redacted_command("llama-server", args),
         quant: &quant,
         model_path: model_path_or_label,
+        active_params: w.active_params,
         context_length,
         spec_decode,
         ttft_ms: Some(speed.prompt_ms.round() as u32),
     };
     let invalid = verification.as_ref().is_some_and(|v| !v.valid);
-    let mut s = build_submission(&ctx, &bench, verification, hf);
+    let mut s = build_submission(&ctx, &bench, verification, hf)?;
+    if let Some(sha256) = exact_sha256 {
+        s.model.gguf_sha256 = Some(sha256);
+    }
     submitter::sign(&mut s)?;
     submitter::emit(&s)?;
     if invalid {
@@ -972,15 +1143,77 @@ mod tests {
             "1",
             "--llama-dir",
             "/opt/llama",
+            "--verification-port",
+            "18080",
         ]))
         .unwrap();
         assert!(w.dry_run);
         assert!(!w.no_verify);
         assert_eq!(w.handle, "@edu");
         assert_eq!(w.llama_dir, "/opt/llama");
+        assert_eq!(w.verification_port, 18080);
         assert!(matches!(w.family, Family::IkLlamaCpp));
         // Only our flags are removed; order and values of the tool's args survive.
         assert_eq!(rest, v(&["-m", "/x/m.gguf", "-ngl", "99", "-fa", "1"]));
+
+        for invalid in ["-1", "0", "NaN", "inf"] {
+            assert!(
+                extract_wrapper_flags(&v(&["--active-params", invalid, "-m", "m.gguf"])).is_err()
+            );
+        }
+        assert!(extract_wrapper_flags(&v(&["--verification-port", "0", "-m", "m.gguf"])).is_err());
+    }
+
+    #[test]
+    fn explicit_model_metadata_rejects_multi_model_matrices() {
+        let group = |model_file: &str| Group {
+            bench: BenchResult::default(),
+            context_length: 512,
+            ngl: -1,
+            threads: None,
+            model_file: model_file.to_string(),
+            skipped_rows: 0,
+        };
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("moe.gguf")],
+            Some(3.0),
+            Some("owner/moe")
+        )
+        .is_ok());
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            Some(3.0),
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("split a multi-model"));
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            None,
+            Some("owner/moe")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("split a multi-model"));
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            None,
+            None
+        )
+        .is_ok());
+
+        let w = WrapOpts {
+            base_model: Some("owner/model".to_string()),
+            ..WrapOpts::default()
+        };
+        assert_eq!(
+            metadata_model_arg("model.gguf", &w).unwrap().as_deref(),
+            Some("model.gguf")
+        );
+        assert!(metadata_model_arg("one.gguf,two.gguf", &w).is_err());
+        assert!(ensure_artifact_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_artifact_hash_unchanged("abc", "def").is_err());
     }
 
     #[test]
@@ -1016,6 +1249,16 @@ mod tests {
             selected_device(&v(&["--device=Vulkan0", "-dev", "Vulkan1,Vulkan0"])),
             Some("Vulkan1,Vulkan0".to_string())
         );
+        assert!(validate_selected_device_scope(Some("CUDA0")).is_ok());
+        assert!(validate_selected_device_scope(None).is_ok());
+        assert!(validate_selected_device_scope(Some("CUDA0,CUDA1"))
+            .unwrap_err()
+            .to_string()
+            .contains("multiple explicit --device"));
+        assert!(group_visible_gpus(&v(&["--split-mode", "layer"])));
+        assert!(group_visible_gpus(&v(&["-sm", "row"])));
+        assert!(!group_visible_gpus(&v(&["--split-mode=none"])));
+        assert!(!group_visible_gpus(&v(&["-sm", "NONE"])));
     }
 
     #[test]

@@ -33,8 +33,8 @@ use contract::{
     EVAL_SCHEMA_VERSION, EVAL_VERSION,
 };
 use submitter::{
-    build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
-    ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
+    build_submission, explicit_canonical, provenance_exact, resolved_quant, BuildCtx, Family,
+    HfProvenance, ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -109,6 +109,19 @@ struct SpeedArgs {
     /// Result-submission API endpoint.
     #[arg(long, default_value = DEFAULT_API)]
     api: String,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
+    /// Active parameters in billions for a sparse model, when officially disclosed.
+    #[arg(long, value_parser = submitter::positive_f64)]
+    active_params: Option<f64>,
+    /// Local port used only by the runner's temporary correctness server.
+    #[arg(
+        long,
+        default_value_t = 8080,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    verification_port: u16,
     /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
     #[arg(
         last = true,
@@ -169,6 +182,12 @@ struct RunArgs {
     /// base_model) so every GGUF repack of the same model groups together.
     #[arg(long)]
     hf_model: Option<String>,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
+    /// Active parameters in billions for a sparse model, when officially disclosed.
+    #[arg(long, value_parser = submitter::positive_f64)]
+    active_params: Option<f64>,
     /// Quantization, e.g. Q4_K_M. Required with --hf-model (selects the .gguf to fetch).
     /// The recorded quant is read from the actual file name (so variants like
     /// UD-Q4_K_XL are preserved); --quant is only a fallback if the name has none.
@@ -246,6 +265,9 @@ struct EvalArgs {
     /// the selected --quant; with --model, verifies the local bytes against it.
     #[arg(long)]
     hf_model: Option<String>,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
     /// Quantization selector/fallback, e.g. Q4_K_M. The GGUF filename remains
     /// authoritative when it contains a quant.
     #[arg(long)]
@@ -393,11 +415,13 @@ fn classic_ctx<'a>(a: &'a RunArgs, model: &'a str, quant: &'a str) -> BuildCtx<'
     BuildCtx {
         gpu_run: a.ngl != 0,
         selected_device: None,
+        group_visible_gpus: true,
         handle: &a.handle,
         family: a.family,
         command,
         quant,
         model_path: model,
+        active_params: a.active_params,
         context_length: a.n_prompt,
         spec_decode: a.spec_decode.clone(),
         ttft_ms: None,
@@ -412,7 +436,7 @@ fn classic_submission(
     v: Option<Verification>,
     hf: HfProvenance,
     ttft_ms: Option<u32>,
-) -> contract::ResultSubmission {
+) -> Result<contract::ResultSubmission> {
     let mut ctx = classic_ctx(a, model, quant);
     ctx.ttft_ms = ttft_ms;
     build_submission(&ctx, b, v, hf)
@@ -451,6 +475,12 @@ fn eval_model_file(model: &str) -> Result<String> {
     Ok(model_file.to_string())
 }
 
+#[derive(Clone, Copy, Default)]
+struct EvalReproProvenance<'a> {
+    hf_model: Option<&'a str>,
+    base_model: Option<&'a str>,
+}
+
 fn eval_command(
     a: &EvalArgs,
     model: &str,
@@ -458,6 +488,7 @@ fn eval_command(
     context_length: u32,
     parallel: u32,
     runtime_args: &[String],
+    provenance: EvalReproProvenance<'_>,
 ) -> Result<String> {
     let reproduce_context = context_length
         .checked_mul(parallel)
@@ -476,6 +507,12 @@ fn eval_command(
         "--context-length".to_string(),
         reproduce_context.to_string(),
     ];
+    if let Some(hf_model) = provenance.hf_model {
+        parts.extend(["--hf-model".to_string(), shell_word(hf_model)]);
+    }
+    if let Some(base_model) = provenance.base_model {
+        parts.extend(["--base-model".to_string(), shell_word(base_model)]);
+    }
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
     }
@@ -526,6 +563,10 @@ fn eval_submission(
         context_length,
         runtime.parallel,
         &runtime.args,
+        EvalReproProvenance {
+            hf_model: hf_model.as_deref(),
+            base_model: base_model.as_deref(),
+        },
     )?;
     if command.chars().count() > 8_000 {
         bail!("eval-v2 reproduce command exceeds 8000 characters");
@@ -574,10 +615,10 @@ fn eval_submission(
     })
 }
 
-fn ensure_eval_hash_unchanged(before: &str, after: &str) -> Result<()> {
+fn ensure_artifact_hash_unchanged(before: &str, after: &str) -> Result<()> {
     if before != after {
         bail!(
-            "model artifact changed while the evaluation was running; refusing to submit ambiguous evidence"
+            "model artifact changed while the run was in progress; refusing to submit ambiguous evidence"
         );
     }
     Ok(())
@@ -654,17 +695,29 @@ fn main() -> Result<()> {
                     family: a.family,
                     llama_dir: a.llama_dir,
                     api: a.api,
+                    base_model: a.base_model,
+                    active_params: a.active_params,
+                    verification_port: a.verification_port,
                 },
                 tool_args,
             );
         }
         Command::Bench(a) => {
             let model = resolve_model(&a)?;
+            let quant = resolved_quant(a.quant.as_deref(), &model);
+            let initial_sha256 = link::fresh_sha256_for(&model)?;
+            let hf = explicit_canonical(
+                provenance_exact(&model_source(&a, &model), &quant, &initial_sha256),
+                a.base_model.as_deref(),
+            )?;
             let dir = resolve_llama_dir(&a, &["llama-bench"])?;
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
-            let quant = resolved_quant(a.quant.as_deref(), &model);
-            let hf = provenance(&model_source(&a, &model), &quant);
-            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None))?;
+            submitter::validate_active_params(a.active_params, b.params_b)?;
+            let final_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_artifact_hash_unchanged(&initial_sha256, &final_sha256)?;
+            let mut submission = classic_submission(&a, &model, &quant, &b, None, hf, None)?;
+            submission.model.gguf_sha256 = Some(final_sha256);
+            submitter::emit(&submission)?;
         }
         Command::Verify(a) => {
             let model = resolve_model(&a)?;
@@ -685,18 +738,26 @@ fn main() -> Result<()> {
             };
             eprintln!("\n▸ [1/4] Model — resolve & download");
             let model = resolve_model(&a)?;
-            let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
+            let initial_sha256 = link::fresh_sha256_for(&model)?;
+            let hf = explicit_canonical(
+                provenance_exact(&model_source(&a, &model), &quant, &initial_sha256),
+                a.base_model.as_deref(),
+            )?;
+            let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             eprintln!("\n▸ [2/4] Benchmark — llama-bench (prefill + decode)");
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
+            submitter::validate_active_params(a.active_params, b.params_b)?;
             eprintln!(
                 "\n▸ [3/4] Verify — llama-server, TTFT probe + {} turns × {} reps (the slow part)",
                 a.turns, a.reps
             );
             let (v, ttft) = verify::run_verification_with_ttft(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
-            let hf = provenance(&model_source(&a, &model), &quant);
-            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft);
+            let final_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_artifact_hash_unchanged(&initial_sha256, &final_sha256)?;
+            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft)?;
+            submission.model.gguf_sha256 = Some(final_sha256);
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
             if !valid {
@@ -724,7 +785,10 @@ fn main() -> Result<()> {
             )?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let gguf_sha256 = link::fresh_sha256_for(&model)?;
-            let hf = provenance_exact(&eval_model_source(&a, &model), &quant, &gguf_sha256);
+            let hf = explicit_canonical(
+                provenance_exact(&eval_model_source(&a, &model), &quant, &gguf_sha256),
+                a.base_model.as_deref(),
+            )?;
             let (backend_version, backend_hash) = eval::server_version(&dir)?;
             let run = eval::run_eval(&eval::EvaluationOpts {
                 server_bin_dir: &dir,
@@ -735,7 +799,7 @@ fn main() -> Result<()> {
                 runtime_args: eval_server_args(&a),
             })?;
             let final_gguf_sha256 = link::fresh_sha256_for(&model)?;
-            ensure_eval_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
+            ensure_artifact_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
             let mut submission = eval_submission(
                 &a,
                 &model,
@@ -823,6 +887,12 @@ mod tests {
             "--dry-run",
             "--family",
             "ik_llama.cpp",
+            "--base-model",
+            "ornith-ai/Ornith-1.5-9B",
+            "--active-params",
+            "3",
+            "--verification-port",
+            "18080",
             "--",
             "llama-server",
             "-m",
@@ -837,6 +907,9 @@ mod tests {
         };
         assert!(a.dry_run);
         assert!(matches!(a.family, Family::IkLlamaCpp));
+        assert_eq!(a.base_model.as_deref(), Some("ornith-ai/Ornith-1.5-9B"));
+        assert_eq!(a.active_params, Some(3.0));
+        assert_eq!(a.verification_port, 18080);
         assert_eq!(a.command[0], "llama-server");
         assert_eq!(
             a.command.last().map(String::as_str),
@@ -847,6 +920,17 @@ mod tests {
             dropin::Mode::Server
         ));
         assert!(speed_mode("/tmp/llama-server").is_err());
+        assert!(Cli::try_parse_from([
+            "llamabench",
+            "speed",
+            "--verification-port",
+            "0",
+            "--",
+            "llama-bench",
+            "-m",
+            "model.gguf",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -869,6 +953,10 @@ mod tests {
             "/home/edu/model-Q4_K_M.gguf",
             "--family",
             "ik_llama.cpp",
+            "--hf-model",
+            "ornith-ai/Ornith-1.5-9B-GGUF",
+            "--base-model",
+            "ornith-ai/Ornith-1.5-9B",
             "--",
             "-ctk",
             "q4_0",
@@ -894,11 +982,17 @@ mod tests {
             262_144,
             runtime.parallel,
             &runtime.args,
+            EvalReproProvenance {
+                hf_model: a.hf_model.as_deref(),
+                base_model: a.base_model.as_deref(),
+            },
         )
         .unwrap();
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--context-length 262144"));
         assert!(command.contains("--family ik_llama.cpp"));
+        assert!(command.contains("--hf-model ornith-ai/Ornith-1.5-9B-GGUF"));
+        assert!(command.contains("--base-model ornith-ai/Ornith-1.5-9B"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
         assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));
@@ -972,6 +1066,7 @@ mod tests {
             262_144,
             runtime.parallel,
             &runtime.args,
+            EvalReproProvenance::default(),
         )
         .unwrap();
         assert!(command.contains("--context-length 524288 -- -np 2"));
@@ -979,7 +1074,7 @@ mod tests {
 
     #[test]
     fn eval_submission_requires_stable_artifact_bytes() {
-        assert!(ensure_eval_hash_unchanged("abc", "abc").is_ok());
-        assert!(ensure_eval_hash_unchanged("abc", "def").is_err());
+        assert!(ensure_artifact_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_artifact_hash_unchanged("abc", "def").is_err());
     }
 }

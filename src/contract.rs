@@ -31,6 +31,10 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub params: f64,
+    /// Active parameters in billions for sparse MoE models. Omitted for dense models
+    /// and when the publisher does not disclose the value.
+    #[serde(rename = "activeParams", skip_serializing_if = "Option::is_none")]
+    pub active_params: Option<f64>,
     /// The canonical model this submission is attributed to: the HF repo one level up
     /// the GGUF's model tree — the unquantized finetune it quantizes, or the base model
     /// when there's no finetune (e.g. `google/gemma-4-12b-it`). Lets every GGUF repack
@@ -337,6 +341,7 @@ mod tests {
             id: "gemma-4-12b-it".to_string(),
             name: "gemma-4-12b-it".to_string(),
             params: 1.0,
+            active_params: Some(0.5),
             base_model: Some("google/gemma-4-12b-it".to_string()),
             hf_model: Some("unsloth/gemma-4-12b-it-GGUF".to_string()),
             hf_verified: Some(true),
@@ -344,6 +349,7 @@ mod tests {
         };
         let j = serde_json::to_value(&m).unwrap();
         assert_eq!(j["baseModel"], "google/gemma-4-12b-it");
+        assert_eq!(j["activeParams"], 0.5);
         assert_eq!(j["hfModel"], "unsloth/gemma-4-12b-it-GGUF");
         assert_eq!(j["hfVerified"], true);
         assert_eq!(j["ggufSha256"], "ab".repeat(32));
@@ -355,6 +361,7 @@ mod tests {
             id: "x".to_string(),
             name: "X".to_string(),
             params: 1.0,
+            active_params: None,
             base_model: None,
             hf_model: None,
             hf_verified: None,
@@ -363,6 +370,7 @@ mod tests {
         let obj = serde_json::to_value(&m).unwrap();
         let obj = obj.as_object().unwrap();
         assert!(!obj.contains_key("baseModel"));
+        assert!(!obj.contains_key("activeParams"));
         assert!(!obj.contains_key("hfModel"));
         assert!(!obj.contains_key("hfVerified"));
         assert!(!obj.contains_key("ggufSha256"));
