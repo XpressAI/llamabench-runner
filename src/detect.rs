@@ -70,8 +70,34 @@ fn parse_nvidia_smi(output: &str) -> Vec<NvidiaGpu> {
         .collect()
 }
 
-fn nvidia_smi_group(output: &str, device_name: &str) -> Option<(usize, u64)> {
-    let matches: Vec<_> = parse_nvidia_smi(output)
+fn nvidia_smi_group(
+    output: &str,
+    device_name: &str,
+    cuda_visible_devices: Option<&str>,
+) -> Option<(usize, u64)> {
+    let gpus = parse_nvidia_smi(output);
+    let visible: Vec<&NvidiaGpu> = match cuda_visible_devices.map(str::trim) {
+        None | Some("") | Some("all") => gpus.iter().collect(),
+        Some("-1") => Vec::new(),
+        Some(value) => {
+            let mut selected = Vec::new();
+            for identity in value.split(',').map(str::trim) {
+                if identity.to_ascii_uppercase().starts_with("MIG-") {
+                    return None;
+                }
+                let gpu = identity
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| gpus.get(index))
+                    .or_else(|| unique_by_identity(&gpus, identity, |gpu| &gpu.uuid))?;
+                if !selected.contains(&gpu) {
+                    selected.push(gpu);
+                }
+            }
+            selected
+        }
+    };
+    let matches: Vec<_> = visible
         .into_iter()
         .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
         .collect();
@@ -263,10 +289,14 @@ pub fn nvidia_gpu_group(
         ])
         .output()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| nvidia_smi_group(&String::from_utf8_lossy(&output.stdout), device_name))?
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    output.status.success().then(|| {
+        nvidia_smi_group(
+            &String::from_utf8_lossy(&output.stdout),
+            device_name,
+            visible.as_deref(),
+        )
+    })?
 }
 
 #[cfg(target_os = "macos")]
@@ -439,9 +469,18 @@ mod tests {
         let output = "GPU-aaaa, CMP 170HX, 65536\n\
                       GPU-bbbb, CMP 170HX, 65536\n\
                       GPU-cccc, NVIDIA H100, 81920\n";
-        assert_eq!(nvidia_smi_group(output, "CMP 170HX"), Some((2, 128)));
-        assert_eq!(nvidia_smi_group(output, "NVIDIA H100"), Some((1, 80)));
-        assert_eq!(nvidia_smi_group(output, "NVIDIA A100"), None);
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX", None), Some((2, 128)));
+        assert_eq!(
+            nvidia_smi_group(output, "CMP 170HX", Some("GPU-bbbb")),
+            Some((1, 64))
+        );
+        assert_eq!(
+            nvidia_smi_group(output, "CMP 170HX", Some("1,2")),
+            Some((1, 64))
+        );
+        assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), Some((1, 80)));
+        assert_eq!(nvidia_smi_group(output, "NVIDIA A100", None), None);
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("-1")), None);
     }
 
     #[test]
