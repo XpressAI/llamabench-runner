@@ -74,7 +74,7 @@ fn nvidia_smi_group(
     output: &str,
     device_name: &str,
     cuda_visible_devices: Option<&str>,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, u64, bool)> {
     let gpus = parse_nvidia_smi(output);
     let visible: Vec<&NvidiaGpu> = match cuda_visible_devices.map(str::trim) {
         None | Some("") | Some("all") => gpus.iter().collect(),
@@ -98,7 +98,18 @@ fn nvidia_smi_group(
                         unique.push(identity);
                     }
                 }
-                return (!unique.is_empty()).then_some((unique.len(), 0));
+                let banner_matches = gpus
+                    .iter()
+                    .any(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+                let homogeneous = banner_matches
+                    && gpus
+                        .iter()
+                        .all(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+                return (!unique.is_empty() && banner_matches).then_some((
+                    unique.len(),
+                    0,
+                    homogeneous,
+                ));
             }
             let mut selected = Vec::new();
             for identity in identities {
@@ -114,17 +125,20 @@ fn nvidia_smi_group(
         }
     };
     if visible.is_empty()
-        || visible
+        || !visible
             .iter()
-            .any(|gpu| !gpu.name.eq_ignore_ascii_case(device_name.trim()))
+            .any(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
     {
         return None;
     }
     let count = visible.len();
+    let homogeneous = visible
+        .iter()
+        .all(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
     let total_bytes = visible.iter().try_fold(0_u64, |total, gpu| {
         total.checked_add(gpu.memory_mib.checked_mul(1024 * 1024)?)
     })?;
-    Some((count, bytes_to_rounded_gib(total_bytes)?))
+    Some((count, bytes_to_rounded_gib(total_bytes)?, homogeneous))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -285,15 +299,15 @@ pub fn nvidia_vram_gb(
     )
 }
 
-/// Count equally named visible CUDA devices and sum their installed VRAM. With no
-/// explicit device selector, llama.cpp splits an offloaded model across all visible
-/// CUDA devices; recording the group prevents a multi-GPU result from masquerading
-/// as a single-card result.
+/// Count visible CUDA devices, sum installed VRAM when physical identities are known,
+/// and report whether every card matches the banner name. With no explicit selector,
+/// llama.cpp splits an offloaded model across all visible CUDA devices; recording the
+/// complete group prevents a multi-GPU result from masquerading as a single-card run.
 pub fn nvidia_gpu_group(
     device_name: &str,
     selected_device: Option<&str>,
     backend_label: &str,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, u64, bool)> {
     if selected_device.is_some()
         || !backend_label
             .split(|ch: char| ch == ',' || ch.is_whitespace())
@@ -490,19 +504,25 @@ mod tests {
                       GPU-cccc, NVIDIA H100, 81920\n";
         // Without a selector, heterogeneous visible cards cannot be represented as
         // one homogeneous hardware identity.
-        assert_eq!(nvidia_smi_group(output, "CMP 170HX", None), None);
+        assert_eq!(
+            nvidia_smi_group(output, "CMP 170HX", None),
+            Some((3, 208, false))
+        );
         assert_eq!(
             nvidia_smi_group(output, "CMP 170HX", Some("GPU-bbbb")),
-            Some((1, 64))
+            Some((1, 64, true))
         );
         assert_eq!(
             nvidia_smi_group(output, "CMP 170HX", Some("1,2")),
-            Some((2, 0))
+            Some((2, 0, false))
         );
-        assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), None);
+        assert_eq!(
+            nvidia_smi_group(output, "NVIDIA H100", None),
+            Some((3, 208, false))
+        );
         assert_eq!(
             nvidia_smi_group(output, "NVIDIA H100", Some("GPU-cccc")),
-            Some((1, 80))
+            Some((1, 80, true))
         );
         assert_eq!(nvidia_smi_group(output, "NVIDIA A100", None), None);
         assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("-1")), None);
@@ -511,7 +531,7 @@ mod tests {
                            GPU-bbbb, CMP 170HX, 65536\n";
         assert_eq!(
             nvidia_smi_group(homogeneous, "CMP 170HX", None),
-            Some((2, 128))
+            Some((2, 128, true))
         );
     }
 

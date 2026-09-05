@@ -441,7 +441,7 @@ pub fn build_submission(
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
     } else if vendor == "NVIDIA" {
-        if let Some((count, total_gib)) = ctx
+        if let Some((count, total_gib, homogeneous)) = ctx
             .group_visible_gpus
             .then(|| {
                 detect::nvidia_gpu_group(&device, ctx.selected_device.as_deref(), &b.backend_label)
@@ -449,7 +449,11 @@ pub fn build_submission(
             .flatten()
         {
             if count > 1 {
-                device = format!("{count}× {device}");
+                device = if homogeneous {
+                    format!("{count}× {device}")
+                } else {
+                    format!("{count}× mixed NVIDIA GPUs")
+                };
             }
             total_gib as f64
         } else {
