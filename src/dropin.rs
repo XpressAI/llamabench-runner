@@ -227,6 +227,20 @@ fn selected_device(args: &[String]) -> Option<String> {
     flag_value(args, &["-dev", "--device"]).filter(|value| !value.is_empty())
 }
 
+fn validate_selected_device_scope(selected: Option<&str>) -> Result<()> {
+    let count = selected
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter(|value| !value.trim().is_empty())
+        .count();
+    if count > 1 {
+        bail!(
+            "multiple explicit --device selectors are not supported; select one device or omit --device to record all visible CUDA devices as a group"
+        );
+    }
+    Ok(())
+}
+
 /// Shell-quote a token if needed (for the recorded reproduce command).
 fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
@@ -573,6 +587,8 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             "pass -m <model.gguf> — llamabench won't benchmark llama-bench's built-in default path"
         );
     }
+    let requested_device = selected_device(args);
+    validate_selected_device_scope(requested_device.as_deref())?;
     // Fail fast before a long run when there's nothing to submit with.
     let token = if w.dry_run {
         None
@@ -635,7 +651,6 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     // Some banners enumerate every installed GPU rather than only the selected one.
     // Ask the exact binary for its labelled devices whenever selection is explicit,
     // or when an accelerator row did not report a device at all.
-    let requested_device = selected_device(args);
     let needs_device_list = requested_device.is_some()
         || groups
             .iter()
@@ -815,6 +830,8 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     if model_path.is_none() && hf_repo_arg.is_none() {
         bail!("pass -m <model.gguf> (or -hf <repo>[:quant]) so llamabench knows what's being benchmarked");
     }
+    let requested_device = selected_device(args);
+    validate_selected_device_scope(requested_device.as_deref())?;
     let token = if w.dry_run {
         None
     } else {
@@ -942,7 +959,6 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         .and_then(|v| v.parse::<i64>().ok());
     let gpu_run = ngl.map_or_else(|| !devices.lock().unwrap().is_empty(), |n| n != 0);
 
-    let requested_device = selected_device(args);
     let listed_devices = if gpu_run {
         bench::list_devices(&bin)
     } else {
@@ -1123,6 +1139,12 @@ mod tests {
             selected_device(&v(&["--device=Vulkan0", "-dev", "Vulkan1,Vulkan0"])),
             Some("Vulkan1,Vulkan0".to_string())
         );
+        assert!(validate_selected_device_scope(Some("CUDA0")).is_ok());
+        assert!(validate_selected_device_scope(None).is_ok());
+        assert!(validate_selected_device_scope(Some("CUDA0,CUDA1"))
+            .unwrap_err()
+            .to_string()
+            .contains("multiple explicit --device"));
     }
 
     #[test]
