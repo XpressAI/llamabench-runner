@@ -97,12 +97,15 @@ fn nvidia_smi_group(
             selected
         }
     };
-    let matches: Vec<_> = visible
-        .into_iter()
-        .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
-        .collect();
-    let count = matches.len();
-    let total_bytes = matches.iter().try_fold(0_u64, |total, gpu| {
+    if visible.is_empty()
+        || visible
+            .iter()
+            .any(|gpu| !gpu.name.eq_ignore_ascii_case(device_name.trim()))
+    {
+        return None;
+    }
+    let count = visible.len();
+    let total_bytes = visible.iter().try_fold(0_u64, |total, gpu| {
         total.checked_add(gpu.memory_mib.checked_mul(1024 * 1024)?)
     })?;
     Some((count, bytes_to_rounded_gib(total_bytes)?))
@@ -469,15 +472,28 @@ mod tests {
         let output = "GPU-aaaa, CMP 170HX, 65536\n\
                       GPU-bbbb, CMP 170HX, 65536\n\
                       GPU-cccc, NVIDIA H100, 81920\n";
-        assert_eq!(nvidia_smi_group(output, "CMP 170HX", None), Some((2, 128)));
+        // Without a selector, heterogeneous visible cards cannot be represented as
+        // one homogeneous hardware identity.
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX", None), None);
         assert_eq!(
             nvidia_smi_group(output, "CMP 170HX", Some("GPU-bbbb")),
             Some((1, 64))
         );
         assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("1,2")), None);
-        assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), Some((1, 80)));
+        assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), None);
+        assert_eq!(
+            nvidia_smi_group(output, "NVIDIA H100", Some("GPU-cccc")),
+            Some((1, 80))
+        );
         assert_eq!(nvidia_smi_group(output, "NVIDIA A100", None), None);
         assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("-1")), None);
+
+        let homogeneous = "GPU-aaaa, CMP 170HX, 65536\n\
+                           GPU-bbbb, CMP 170HX, 65536\n";
+        assert_eq!(
+            nvidia_smi_group(homogeneous, "CMP 170HX", None),
+            Some((2, 128))
+        );
     }
 
     #[test]

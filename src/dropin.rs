@@ -544,10 +544,14 @@ fn verify_args_for(g: &Group) -> Vec<String> {
     a
 }
 
-fn validate_active_params_scope(groups: &[Group], active_params: Option<f64>) -> Result<()> {
-    let Some(_) = active_params else {
+fn validate_model_metadata_scope(
+    groups: &[Group],
+    active_params: Option<f64>,
+    base_model: Option<&str>,
+) -> Result<()> {
+    if active_params.is_none() && base_model.is_none() {
         return Ok(());
-    };
+    }
     let Some(first_model) = groups.first().map(|group| &group.model_file) else {
         return Ok(());
     };
@@ -556,7 +560,7 @@ fn validate_active_params_scope(groups: &[Group], active_params: Option<f64>) ->
         .any(|group| group.model_file.as_str() != first_model.as_str())
     {
         bail!(
-            "--active-params applies to one model; split a multi-model llama-bench matrix into separate commands"
+            "--active-params and --base-model apply to one model; split a multi-model llama-bench matrix into separate commands"
         );
     }
     Ok(())
@@ -626,7 +630,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             skipped_rows: 0,
         });
     }
-    validate_active_params_scope(&groups, w.active_params)?;
+    validate_model_metadata_scope(&groups, w.active_params, w.base_model.as_deref())?;
 
     // Some banners enumerate every installed GPU rather than only the selected one.
     // Ask the exact binary for its labelled devices whenever selection is explicit,
@@ -1047,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn active_params_reject_multi_model_matrices() {
+    fn explicit_model_metadata_rejects_multi_model_matrices() {
         let group = |model_file: &str| Group {
             bench: BenchResult::default(),
             context_length: 512,
@@ -1056,19 +1060,34 @@ mod tests {
             model_file: model_file.to_string(),
             skipped_rows: 0,
         };
-        assert!(
-            validate_active_params_scope(&[group("moe.gguf"), group("moe.gguf")], Some(3.0))
-                .is_ok()
-        );
-        assert!(
-            validate_active_params_scope(&[group("moe.gguf"), group("dense.gguf")], Some(3.0))
-                .unwrap_err()
-                .to_string()
-                .contains("split a multi-model")
-        );
-        assert!(
-            validate_active_params_scope(&[group("moe.gguf"), group("dense.gguf")], None).is_ok()
-        );
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("moe.gguf")],
+            Some(3.0),
+            Some("owner/moe")
+        )
+        .is_ok());
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            Some(3.0),
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("split a multi-model"));
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            None,
+            Some("owner/moe")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("split a multi-model"));
+        assert!(validate_model_metadata_scope(
+            &[group("moe.gguf"), group("dense.gguf")],
+            None,
+            None
+        )
+        .is_ok());
     }
 
     #[test]

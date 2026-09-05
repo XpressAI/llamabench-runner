@@ -116,7 +116,11 @@ struct SpeedArgs {
     #[arg(long, value_parser = submitter::positive_f64)]
     active_params: Option<f64>,
     /// Local port used only by the runner's temporary correctness server.
-    #[arg(long, default_value_t = 8080)]
+    #[arg(
+        long,
+        default_value_t = 8080,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
     verification_port: u16,
     /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
     #[arg(
@@ -904,6 +908,17 @@ mod tests {
             dropin::Mode::Server
         ));
         assert!(speed_mode("/tmp/llama-server").is_err());
+        assert!(Cli::try_parse_from([
+            "llamabench",
+            "speed",
+            "--verification-port",
+            "0",
+            "--",
+            "llama-bench",
+            "-m",
+            "model.gguf",
+        ])
+        .is_err());
     }
 
     #[test]
