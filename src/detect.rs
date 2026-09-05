@@ -6,7 +6,12 @@
 /// Infer the vendor bucket from a device name.
 pub fn vendor_of(name: &str) -> &'static str {
     let n = name.to_lowercase();
-    if n.contains("nvidia") || n.contains("geforce") || n.contains("rtx") || n.contains("tesla") {
+    if n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rtx")
+        || n.contains("tesla")
+        || n.contains("cmp ")
+    {
         "NVIDIA"
     } else if n.contains("amd") || n.contains("radeon") || n.contains("instinct") {
         "AMD"
@@ -63,6 +68,18 @@ fn parse_nvidia_smi(output: &str) -> Vec<NvidiaGpu> {
             })
         })
         .collect()
+}
+
+fn nvidia_smi_group(output: &str, device_name: &str) -> Option<(usize, u64)> {
+    let matches: Vec<_> = parse_nvidia_smi(output)
+        .into_iter()
+        .filter(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()))
+        .collect();
+    let count = matches.len();
+    let total_bytes = matches.iter().try_fold(0_u64, |total, gpu| {
+        total.checked_add(gpu.memory_mib.checked_mul(1024 * 1024)?)
+    })?;
+    Some((count, bytes_to_rounded_gib(total_bytes)?))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -223,6 +240,35 @@ pub fn nvidia_vram_gb(
     )
 }
 
+/// Count equally named visible CUDA devices and sum their installed VRAM. With no
+/// explicit device selector, llama.cpp splits an offloaded model across all visible
+/// CUDA devices; recording the group prevents a multi-GPU result from masquerading
+/// as a single-card result.
+pub fn nvidia_gpu_group(
+    device_name: &str,
+    selected_device: Option<&str>,
+    backend_label: &str,
+) -> Option<(usize, u64)> {
+    if selected_device.is_some()
+        || !backend_label
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .any(|part| part.eq_ignore_ascii_case("CUDA"))
+    {
+        return None;
+    }
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=uuid,name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| nvidia_smi_group(&String::from_utf8_lossy(&output.stdout), device_name))?
+}
+
 #[cfg(target_os = "macos")]
 fn sysctl(key: &str) -> Option<String> {
     let out = std::process::Command::new("sysctl")
@@ -381,10 +427,21 @@ mod tests {
     fn vendor_inference() {
         assert_eq!(vendor_of("AMD Radeon Pro 5500M (MoltenVK)"), "AMD");
         assert_eq!(vendor_of("NVIDIA GeForce RTX 4090"), "NVIDIA");
+        assert_eq!(vendor_of("CMP 170HX"), "NVIDIA");
         assert_eq!(vendor_of("Apple M4 Max"), "Apple");
         assert_eq!(vendor_of("Apple M5 Pro"), "Apple");
         assert_eq!(vendor_of("Intel(R) UHD Graphics 630"), "Intel");
         assert_eq!(vendor_of("Ryzen 9 7950X"), "CPU");
+    }
+
+    #[test]
+    fn groups_same_model_nvidia_devices_and_sums_vram() {
+        let output = "GPU-aaaa, CMP 170HX, 65536\n\
+                      GPU-bbbb, CMP 170HX, 65536\n\
+                      GPU-cccc, NVIDIA H100, 81920\n";
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX"), Some((2, 128)));
+        assert_eq!(nvidia_smi_group(output, "NVIDIA H100"), Some((1, 80)));
+        assert_eq!(nvidia_smi_group(output, "NVIDIA A100"), None);
     }
 
     #[test]

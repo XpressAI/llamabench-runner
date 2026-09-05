@@ -351,7 +351,7 @@ pub fn build_submission(
 ) -> ResultSubmission {
     // On Apple Silicon the GPU is the chip, and the Metal banner reads noisily as
     // "MTL0 (Apple M4)"; sysctl gives the clean canonical name, so prefer it for GPU runs.
-    let device = ctx
+    let mut device = ctx
         .gpu_run
         .then(detect::apple_chip)
         .flatten()
@@ -393,8 +393,17 @@ pub fn build_submission(
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
     } else if vendor == "NVIDIA" {
-        detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
-            .map_or(0.0, |gib| gib as f64)
+        if let Some((count, total_gib)) =
+            detect::nvidia_gpu_group(&device, ctx.selected_device.as_deref(), &b.backend_label)
+        {
+            if count > 1 {
+                device = format!("{count}× {device}");
+            }
+            total_gib as f64
+        } else {
+            detect::nvidia_vram_gb(&device, ctx.selected_device.as_deref(), &b.backend_label)
+                .map_or(0.0, |gib| gib as f64)
+        }
     } else {
         0.0
     };
