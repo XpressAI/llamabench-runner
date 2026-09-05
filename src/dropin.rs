@@ -607,6 +607,15 @@ fn metadata_model_arg(model_arg: &str, w: &WrapOpts) -> Result<Option<String>> {
     Ok(models.first().map(|model| (*model).to_string()))
 }
 
+fn ensure_artifact_hash_unchanged(before: &str, after: &str) -> Result<()> {
+    if before != after {
+        bail!(
+            "model artifact changed while the run was in progress; refusing to submit ambiguous evidence"
+        );
+    }
+    Ok(())
+}
+
 fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     let explicit_model = flag_value(args, &["-m", "--model"]).filter(|v| !v.is_empty());
     if explicit_model.is_none() {
@@ -622,10 +631,18 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             .as_deref()
             .context("--base-model requires one explicit model")?;
         let quant = submitter::resolved_quant(None, model);
-        Some(submitter::explicit_canonical(
-            submitter::provenance(&ModelSource::LocalOnly(model), &quant),
-            w.base_model.as_deref(),
-        )?)
+        let initial_sha256 = crate::link::fresh_sha256_for(model)?;
+        Some((
+            submitter::explicit_canonical(
+                submitter::provenance_exact(
+                    &ModelSource::LocalOnly(model),
+                    &quant,
+                    &initial_sha256,
+                ),
+                w.base_model.as_deref(),
+            )?,
+            initial_sha256,
+        ))
     } else {
         None
     };
@@ -687,6 +704,9 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         });
     }
     validate_model_metadata_scope(&groups, w.active_params, w.base_model.as_deref())?;
+    for group in &groups {
+        submitter::validate_active_params(w.active_params, group.bench.params_b)?;
+    }
 
     // Some banners enumerate every installed GPU rather than only the selected one.
     // Ask the exact binary for its labelled devices whenever selection is explicit,
@@ -756,12 +776,19 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             }
         };
         let quant = submitter::resolved_quant(None, &g.model_file);
-        let hf = match &prepared_hf {
-            Some(hf) => hf.clone(),
-            None => submitter::explicit_canonical(
-                submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
-                w.base_model.as_deref(),
-            )?,
+        let (hf, exact_sha256) = match &prepared_hf {
+            Some((hf, initial_sha256)) => {
+                let final_sha256 = crate::link::fresh_sha256_for(&g.model_file)?;
+                ensure_artifact_hash_unchanged(initial_sha256, &final_sha256)?;
+                (hf.clone(), Some(final_sha256))
+            }
+            None => (
+                submitter::explicit_canonical(
+                    submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
+                    w.base_model.as_deref(),
+                )?,
+                None,
+            ),
         };
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
@@ -779,6 +806,9 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         };
         let invalid = verification.as_ref().is_some_and(|v| !v.valid);
         let mut s = build_submission(&ctx, &g.bench, verification, hf)?;
+        if let Some(sha256) = exact_sha256 {
+            s.model.gguf_sha256 = Some(sha256);
+        }
         submitter::sign(&mut s)?;
         submitter::emit(&s)?;
         if invalid {
@@ -881,8 +911,9 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     let prepared_model = match (&model_path, &hf_repo_arg) {
         (Some(m), _) => {
             let quant = submitter::resolved_quant(None, m);
+            let initial_sha256 = crate::link::fresh_sha256_for(m)?;
             let hf = submitter::explicit_canonical(
-                submitter::provenance(&ModelSource::LocalOnly(m), &quant),
+                submitter::provenance_exact(&ModelSource::LocalOnly(m), &quant, &initial_sha256),
                 w.base_model.as_deref(),
             )?;
             let label = hf
@@ -890,7 +921,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
                 .name
                 .clone()
                 .unwrap_or_else(|| submitter::model_name(m));
-            (label, quant, hf)
+            (label, quant, hf, Some(initial_sha256))
         }
         (None, Some(spec)) => {
             let (repo, tag) = match spec.split_once(':') {
@@ -904,10 +935,14 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
                 w.base_model.as_deref(),
             )?;
             let label = hf.canonical.name.clone().unwrap_or(label);
-            (label, quant, hf)
+            (label, quant, hf, None)
         }
         (None, None) => unreachable!("guarded above"),
     };
+    submitter::validate_active_params(
+        w.active_params,
+        submitter::params_from_name(&prepared_model.0),
+    )?;
     let token = if w.dry_run {
         None
     } else {
@@ -985,7 +1020,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         }
     };
 
-    let (model_label, quant, hf) = prepared_model;
+    let (model_label, quant, hf, initial_sha256) = prepared_model;
     let context_length = server_ctx(port, api_key.as_deref())
         .or_else(|| flag_value(args, &["-c", "--ctx-size"]).and_then(|v| v.parse().ok()))
         .filter(|c| *c > 0)
@@ -1044,6 +1079,14 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         devices: detected_devices,
     };
     let model_path_or_label = model_path.as_deref().unwrap_or(&model_label);
+    let exact_sha256 = match initial_sha256 {
+        Some(initial) => {
+            let final_sha256 = crate::link::fresh_sha256_for(model_path_or_label)?;
+            ensure_artifact_hash_unchanged(&initial, &final_sha256)?;
+            Some(final_sha256)
+        }
+        None => None,
+    };
     let ctx = BuildCtx {
         gpu_run,
         selected_device: requested_device,
@@ -1060,6 +1103,9 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     };
     let invalid = verification.as_ref().is_some_and(|v| !v.valid);
     let mut s = build_submission(&ctx, &bench, verification, hf)?;
+    if let Some(sha256) = exact_sha256 {
+        s.model.gguf_sha256 = Some(sha256);
+    }
     submitter::sign(&mut s)?;
     submitter::emit(&s)?;
     if invalid {
@@ -1166,6 +1212,8 @@ mod tests {
             Some("model.gguf")
         );
         assert!(metadata_model_arg("one.gguf,two.gguf", &w).is_err());
+        assert!(ensure_artifact_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_artifact_hash_unchanged("abc", "def").is_err());
     }
 
     #[test]

@@ -376,7 +376,7 @@ pub struct BuildCtx<'a> {
     pub ttft_ms: Option<u32>,
 }
 
-fn validate_active_params(active_params: Option<f64>, total_params: f64) -> Result<()> {
+pub(crate) fn validate_active_params(active_params: Option<f64>, total_params: f64) -> Result<()> {
     let Some(active) = active_params else {
         return Ok(());
     };

@@ -33,8 +33,8 @@ use contract::{
     EVAL_SCHEMA_VERSION, EVAL_VERSION,
 };
 use submitter::{
-    build_submission, explicit_canonical, provenance, provenance_exact, resolved_quant, BuildCtx,
-    Family, HfProvenance, ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
+    build_submission, explicit_canonical, provenance_exact, resolved_quant, BuildCtx, Family,
+    HfProvenance, ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -615,10 +615,10 @@ fn eval_submission(
     })
 }
 
-fn ensure_eval_hash_unchanged(before: &str, after: &str) -> Result<()> {
+fn ensure_artifact_hash_unchanged(before: &str, after: &str) -> Result<()> {
     if before != after {
         bail!(
-            "model artifact changed while the evaluation was running; refusing to submit ambiguous evidence"
+            "model artifact changed while the run was in progress; refusing to submit ambiguous evidence"
         );
     }
     Ok(())
@@ -705,13 +705,19 @@ fn main() -> Result<()> {
         Command::Bench(a) => {
             let model = resolve_model(&a)?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
+            let initial_sha256 = link::fresh_sha256_for(&model)?;
             let hf = explicit_canonical(
-                provenance(&model_source(&a, &model), &quant),
+                provenance_exact(&model_source(&a, &model), &quant, &initial_sha256),
                 a.base_model.as_deref(),
             )?;
             let dir = resolve_llama_dir(&a, &["llama-bench"])?;
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
-            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None)?)?;
+            submitter::validate_active_params(a.active_params, b.params_b)?;
+            let final_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_artifact_hash_unchanged(&initial_sha256, &final_sha256)?;
+            let mut submission = classic_submission(&a, &model, &quant, &b, None, hf, None)?;
+            submission.model.gguf_sha256 = Some(final_sha256);
+            submitter::emit(&submission)?;
         }
         Command::Verify(a) => {
             let model = resolve_model(&a)?;
@@ -733,20 +739,25 @@ fn main() -> Result<()> {
             eprintln!("\n▸ [1/4] Model — resolve & download");
             let model = resolve_model(&a)?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
+            let initial_sha256 = link::fresh_sha256_for(&model)?;
             let hf = explicit_canonical(
-                provenance(&model_source(&a, &model), &quant),
+                provenance_exact(&model_source(&a, &model), &quant, &initial_sha256),
                 a.base_model.as_deref(),
             )?;
             let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             eprintln!("\n▸ [2/4] Benchmark — llama-bench (prefill + decode)");
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
+            submitter::validate_active_params(a.active_params, b.params_b)?;
             eprintln!(
                 "\n▸ [3/4] Verify — llama-server, TTFT probe + {} turns × {} reps (the slow part)",
                 a.turns, a.reps
             );
             let (v, ttft) = verify::run_verification_with_ttft(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
+            let final_sha256 = link::fresh_sha256_for(&model)?;
+            ensure_artifact_hash_unchanged(&initial_sha256, &final_sha256)?;
             let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft)?;
+            submission.model.gguf_sha256 = Some(final_sha256);
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
             if !valid {
@@ -788,7 +799,7 @@ fn main() -> Result<()> {
                 runtime_args: eval_server_args(&a),
             })?;
             let final_gguf_sha256 = link::fresh_sha256_for(&model)?;
-            ensure_eval_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
+            ensure_artifact_hash_unchanged(&gguf_sha256, &final_gguf_sha256)?;
             let mut submission = eval_submission(
                 &a,
                 &model,
@@ -1063,7 +1074,7 @@ mod tests {
 
     #[test]
     fn eval_submission_requires_stable_artifact_bytes() {
-        assert!(ensure_eval_hash_unchanged("abc", "abc").is_ok());
-        assert!(ensure_eval_hash_unchanged("abc", "def").is_err());
+        assert!(ensure_artifact_hash_unchanged("abc", "abc").is_ok());
+        assert!(ensure_artifact_hash_unchanged("abc", "def").is_err());
     }
 }
