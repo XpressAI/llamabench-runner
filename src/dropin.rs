@@ -13,7 +13,8 @@
 //!   output-correctness verification against that same process.
 //!
 //! Runner-owned flags (`--dry-run`, `--no-verify`, `--token`, `--handle`,
-//! `--family`, `--llama-dir`, `--api`, `--download-llama`) are extracted before
+//! `--family`, `--llama-dir`, `--api`, `--download-llama`, `--base-model`,
+//! `--active-params`) are extracted before
 //! passthrough; none collide with llama.cpp flag names.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,6 +48,8 @@ pub struct WrapOpts {
     pub family: Family,
     pub llama_dir: String,
     pub api: String,
+    pub base_model: Option<String>,
+    pub active_params: Option<f64>,
 }
 
 impl Default for WrapOpts {
@@ -60,6 +63,8 @@ impl Default for WrapOpts {
             family: Family::LlamaCpp,
             llama_dir: String::new(),
             api: submitter::DEFAULT_API.to_string(),
+            base_model: None,
+            active_params: None,
         }
     }
 }
@@ -112,6 +117,11 @@ fn extract_wrapper_flags(args: &[String]) -> Result<(WrapOpts, Vec<String>)> {
             "--family" => w.family = Family::parse(&take_value(args, &mut i, name, inline)?)?,
             "--llama-dir" => w.llama_dir = take_value(args, &mut i, name, inline)?,
             "--api" => w.api = take_value(args, &mut i, name, inline)?,
+            "--base-model" => w.base_model = Some(take_value(args, &mut i, name, inline)?),
+            "--active-params" => {
+                let value = take_value(args, &mut i, name, inline)?;
+                w.active_params = Some(value.parse().context("--active-params must be a number")?);
+            }
             _ => rest.push(a.clone()),
         }
         i += 1;
@@ -655,7 +665,10 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             }
         };
         let quant = submitter::resolved_quant(None, &g.model_file);
-        let hf = submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant);
+        let hf = submitter::explicit_canonical(
+            submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
+            w.base_model.as_deref(),
+        )?;
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
             selected_device: requested_device.clone(),
@@ -664,6 +677,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             command: command.clone(),
             quant: &quant,
             model_path: &g.model_file,
+            active_params: w.active_params,
             context_length: g.context_length,
             spec_decode: "none".to_string(),
             ttft_ms,
@@ -847,7 +861,10 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     let (model_label, quant, hf) = match (&model_path, &hf_repo_arg) {
         (Some(m), _) => {
             let quant = submitter::resolved_quant(None, m);
-            let hf = submitter::provenance(&ModelSource::LocalOnly(m), &quant);
+            let hf = submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::LocalOnly(m), &quant),
+                w.base_model.as_deref(),
+            )?;
             (submitter::model_name(m), quant, hf)
         }
         (None, Some(spec)) => {
@@ -857,7 +874,10 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
             };
             let label = repo.rsplit('/').next().unwrap_or(&repo).to_string();
             let quant = tag.unwrap_or_else(|| "unknown".to_string());
-            let hf = submitter::provenance(&ModelSource::Downloaded(&repo), &quant);
+            let hf = submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::Downloaded(&repo), &quant),
+                w.base_model.as_deref(),
+            )?;
             (label, quant, hf)
         }
         (None, None) => unreachable!("guarded above"),
@@ -929,6 +949,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         command: redacted_command("llama-server", args),
         quant: &quant,
         model_path: model_path_or_label,
+        active_params: w.active_params,
         context_length,
         spec_decode,
         ttft_ms: Some(speed.prompt_ms.round() as u32),

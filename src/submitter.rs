@@ -105,6 +105,39 @@ pub fn resolve_canonical(repo: &str) -> Canonical {
     }
 }
 
+/// Apply an explicit canonical HF model when the GGUF repository does not publish
+/// `cardData.base_model`. The source GGUF repository must still be present in the
+/// provenance; this flag changes grouping identity, never artifact attribution.
+pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Result<HfProvenance> {
+    let Some(base_model) = base_model else {
+        return Ok(hf);
+    };
+    let base_model = base_model.trim();
+    let valid = base_model.split_once('/').is_some_and(|(owner, name)| {
+        !owner.is_empty()
+            && !name.is_empty()
+            && !name.contains('/')
+            && !base_model.chars().any(char::is_control)
+    });
+    if !valid {
+        bail!("--base-model must be a Hugging Face repo in owner/name form");
+    }
+    if hf.model.is_none() {
+        bail!("--base-model requires Hugging Face GGUF provenance (link the local file first, or pass --hf-model)");
+    }
+    let (id, name) = canonical_id_name(base_model);
+    eprintln!(
+        "→ model: {name} (explicit base of {})",
+        hf.model.as_deref().unwrap_or("GGUF")
+    );
+    hf.canonical = Canonical {
+        base_model: Some(base_model.to_string()),
+        id: Some(id),
+        name: Some(name),
+    };
+    Ok(hf)
+}
+
 /// Hugging Face provenance recorded on the model: the source repo, whether the bytes
 /// are confirmed to come from it, and the canonical (base/finetune) model identity it
 /// should be attributed to. Maps to `ModelInfo.hf_model` / `hf_verified` / `base_model`
@@ -304,6 +337,7 @@ pub struct BuildCtx<'a> {
     pub command: String,
     pub quant: &'a str,
     pub model_path: &'a str,
+    pub active_params: Option<f64>,
     pub context_length: u32,
     pub spec_decode: String,
     pub ttft_ms: Option<u32>,
@@ -379,6 +413,7 @@ pub fn build_submission(
             id: model_id,
             name,
             params: b.params_b,
+            active_params: ctx.active_params,
             base_model,
             hf_model,
             hf_verified,
@@ -551,6 +586,29 @@ mod tests {
         let (id, name) = canonical_id_name("Org/Sub/Gemma 4 12B It");
         assert_eq!(name, "Gemma 4 12B It");
         assert_eq!(id, "gemma-4-12b-it");
+    }
+
+    #[test]
+    fn explicit_canonical_requires_repo_provenance() {
+        let err = explicit_canonical(HfProvenance::none(), Some("ornith-ai/Ornith-1.5-9B"))
+            .err()
+            .expect("missing GGUF provenance must fail");
+        assert!(err
+            .to_string()
+            .contains("requires Hugging Face GGUF provenance"));
+
+        let hf = HfProvenance {
+            model: Some("ornith-ai/Ornith-1.5-9B-GGUF".to_string()),
+            verified: Some(true),
+            canonical: Canonical::default(),
+        };
+        let resolved = explicit_canonical(hf, Some("ornith-ai/Ornith-1.5-9B")).unwrap();
+        assert_eq!(resolved.canonical.id.as_deref(), Some("ornith-1-5-9b"));
+        assert_eq!(resolved.canonical.name.as_deref(), Some("Ornith-1.5-9B"));
+        assert_eq!(
+            resolved.canonical.base_model.as_deref(),
+            Some("ornith-ai/Ornith-1.5-9B")
+        );
     }
 
     #[test]

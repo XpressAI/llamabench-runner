@@ -33,8 +33,8 @@ use contract::{
     EVAL_SCHEMA_VERSION, EVAL_VERSION,
 };
 use submitter::{
-    build_submission, provenance, provenance_exact, resolved_quant, BuildCtx, Family, HfProvenance,
-    ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
+    build_submission, explicit_canonical, provenance, provenance_exact, resolved_quant, BuildCtx,
+    Family, HfProvenance, ModelSource, DEFAULT_API, DEFAULT_EVAL_API,
 };
 use verify::{run_verification, VerifyOpts};
 
@@ -109,6 +109,12 @@ struct SpeedArgs {
     /// Result-submission API endpoint.
     #[arg(long, default_value = DEFAULT_API)]
     api: String,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
+    /// Active parameters in billions for a sparse model, when officially disclosed.
+    #[arg(long, value_parser = positive_f64)]
+    active_params: Option<f64>,
     /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
     #[arg(
         last = true,
@@ -169,6 +175,12 @@ struct RunArgs {
     /// base_model) so every GGUF repack of the same model groups together.
     #[arg(long)]
     hf_model: Option<String>,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
+    /// Active parameters in billions for a sparse model, when officially disclosed.
+    #[arg(long, value_parser = positive_f64)]
+    active_params: Option<f64>,
     /// Quantization, e.g. Q4_K_M. Required with --hf-model (selects the .gguf to fetch).
     /// The recorded quant is read from the actual file name (so variants like
     /// UD-Q4_K_XL are preserved); --quant is only a fallback if the name has none.
@@ -246,6 +258,9 @@ struct EvalArgs {
     /// the selected --quant; with --model, verifies the local bytes against it.
     #[arg(long)]
     hf_model: Option<String>,
+    /// Canonical HF model repo when the GGUF repo omits cardData.base_model.
+    #[arg(long)]
+    base_model: Option<String>,
     /// Quantization selector/fallback, e.g. Q4_K_M. The GGUF filename remains
     /// authoritative when it contains a quant.
     #[arg(long)]
@@ -294,6 +309,17 @@ fn bench_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> BenchOp
         ctv: &a.ctv,
         n_prompt: a.n_prompt,
         n_gen: a.n_gen,
+    }
+}
+
+fn positive_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| "must be a number".to_string())?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("must be a finite number greater than zero".to_string())
     }
 }
 
@@ -398,6 +424,7 @@ fn classic_ctx<'a>(a: &'a RunArgs, model: &'a str, quant: &'a str) -> BuildCtx<'
         command,
         quant,
         model_path: model,
+        active_params: a.active_params,
         context_length: a.n_prompt,
         spec_decode: a.spec_decode.clone(),
         ttft_ms: None,
@@ -476,6 +503,12 @@ fn eval_command(
         "--context-length".to_string(),
         reproduce_context.to_string(),
     ];
+    if let Some(hf_model) = a.hf_model.as_deref() {
+        parts.extend(["--hf-model".to_string(), shell_word(hf_model)]);
+    }
+    if let Some(base_model) = a.base_model.as_deref() {
+        parts.extend(["--base-model".to_string(), shell_word(base_model)]);
+    }
     if a.family != Family::LlamaCpp {
         parts.extend(["--family".to_string(), a.family.backend_name().to_string()]);
     }
@@ -654,6 +687,8 @@ fn main() -> Result<()> {
                     family: a.family,
                     llama_dir: a.llama_dir,
                     api: a.api,
+                    base_model: a.base_model,
+                    active_params: a.active_params,
                 },
                 tool_args,
             );
@@ -663,7 +698,10 @@ fn main() -> Result<()> {
             let dir = resolve_llama_dir(&a, &["llama-bench"])?;
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
-            let hf = provenance(&model_source(&a, &model), &quant);
+            let hf = explicit_canonical(
+                provenance(&model_source(&a, &model), &quant),
+                a.base_model.as_deref(),
+            )?;
             submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None))?;
         }
         Command::Verify(a) => {
@@ -695,7 +733,10 @@ fn main() -> Result<()> {
             );
             let (v, ttft) = verify::run_verification_with_ttft(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
-            let hf = provenance(&model_source(&a, &model), &quant);
+            let hf = explicit_canonical(
+                provenance(&model_source(&a, &model), &quant),
+                a.base_model.as_deref(),
+            )?;
             let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft);
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
@@ -724,7 +765,10 @@ fn main() -> Result<()> {
             )?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let gguf_sha256 = link::fresh_sha256_for(&model)?;
-            let hf = provenance_exact(&eval_model_source(&a, &model), &quant, &gguf_sha256);
+            let hf = explicit_canonical(
+                provenance_exact(&eval_model_source(&a, &model), &quant, &gguf_sha256),
+                a.base_model.as_deref(),
+            )?;
             let (backend_version, backend_hash) = eval::server_version(&dir)?;
             let run = eval::run_eval(&eval::EvaluationOpts {
                 server_bin_dir: &dir,
@@ -823,6 +867,10 @@ mod tests {
             "--dry-run",
             "--family",
             "ik_llama.cpp",
+            "--base-model",
+            "ornith-ai/Ornith-1.5-9B",
+            "--active-params",
+            "3",
             "--",
             "llama-server",
             "-m",
@@ -837,6 +885,8 @@ mod tests {
         };
         assert!(a.dry_run);
         assert!(matches!(a.family, Family::IkLlamaCpp));
+        assert_eq!(a.base_model.as_deref(), Some("ornith-ai/Ornith-1.5-9B"));
+        assert_eq!(a.active_params, Some(3.0));
         assert_eq!(a.command[0], "llama-server");
         assert_eq!(
             a.command.last().map(String::as_str),
@@ -869,6 +919,10 @@ mod tests {
             "/home/edu/model-Q4_K_M.gguf",
             "--family",
             "ik_llama.cpp",
+            "--hf-model",
+            "ornith-ai/Ornith-1.5-9B-GGUF",
+            "--base-model",
+            "ornith-ai/Ornith-1.5-9B",
             "--",
             "-ctk",
             "q4_0",
@@ -899,6 +953,8 @@ mod tests {
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
         assert!(command.contains("--context-length 262144"));
         assert!(command.contains("--family ik_llama.cpp"));
+        assert!(command.contains("--hf-model ornith-ai/Ornith-1.5-9B-GGUF"));
+        assert!(command.contains("--base-model ornith-ai/Ornith-1.5-9B"));
         assert!(command.contains("-- -ctk q4_0 -ctv q4_0"));
         assert!(command.contains("'a template with spaces'"));
         assert!(!command.contains("/home/edu"));

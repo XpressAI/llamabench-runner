@@ -83,6 +83,16 @@ llamabench link --list            # show all links
 llamabench link --forget <path>   # remove one
 ```
 
+Some publisher-owned GGUF repos omit Hugging Face's `base_model` metadata. After
+linking the exact file, pass `--base-model owner/model` to `speed` or `eval` so
+all quants group under the intended model. For a sparse model, `speed` also accepts
+`--active-params N` when the publisher discloses that count:
+
+```sh
+llamabench speed --base-model ornith-ai/Ornith-1.5-35B-A3B \
+  --active-params 3 -- llama-bench -m ./Ornith-1.5-35B-A3B-Q4_K_M.gguf -ngl -1
+```
+
 ### Compatibility subcommands
 
 The original flag-based `run`/`bench`/`verify` interface remains available for
