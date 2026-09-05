@@ -77,8 +77,8 @@ fn nvidia_smi_group(
 ) -> Option<(usize, u64, bool)> {
     let gpus = parse_nvidia_smi(output);
     let visible: Vec<&NvidiaGpu> = match cuda_visible_devices.map(str::trim) {
-        None | Some("") | Some("all") => gpus.iter().collect(),
-        Some("-1") => Vec::new(),
+        None | Some("all") => gpus.iter().collect(),
+        Some("") | Some("-1") => Vec::new(),
         Some(value) => {
             let identities: Vec<_> = value
                 .split(',')
@@ -525,6 +525,7 @@ mod tests {
             Some((1, 80, true))
         );
         assert_eq!(nvidia_smi_group(output, "NVIDIA A100", None), None);
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("")), None);
         assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("-1")), None);
 
         let homogeneous = "GPU-aaaa, CMP 170HX, 65536\n\

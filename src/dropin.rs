@@ -924,7 +924,12 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
                 submitter::provenance(&ModelSource::LocalOnly(m), &quant),
                 w.base_model.as_deref(),
             )?;
-            (submitter::model_name(m), quant, hf)
+            let label = hf
+                .canonical
+                .name
+                .clone()
+                .unwrap_or_else(|| submitter::model_name(m));
+            (label, quant, hf)
         }
         (None, Some(spec)) => {
             let (repo, tag) = match spec.split_once(':') {
@@ -937,6 +942,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
                 submitter::provenance(&ModelSource::Downloaded(&repo), &quant),
                 w.base_model.as_deref(),
             )?;
+            let label = hf.canonical.name.clone().unwrap_or(label);
             (label, quant, hf)
         }
         (None, None) => unreachable!("guarded above"),

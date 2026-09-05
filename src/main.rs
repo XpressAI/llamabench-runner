@@ -704,13 +704,13 @@ fn main() -> Result<()> {
         }
         Command::Bench(a) => {
             let model = resolve_model(&a)?;
-            let dir = resolve_llama_dir(&a, &["llama-bench"])?;
-            let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
             let hf = explicit_canonical(
                 provenance(&model_source(&a, &model), &quant),
                 a.base_model.as_deref(),
             )?;
+            let dir = resolve_llama_dir(&a, &["llama-bench"])?;
+            let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None)?)?;
         }
         Command::Verify(a) => {
@@ -732,8 +732,12 @@ fn main() -> Result<()> {
             };
             eprintln!("\n▸ [1/4] Model — resolve & download");
             let model = resolve_model(&a)?;
-            let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             let quant = resolved_quant(a.quant.as_deref(), &model);
+            let hf = explicit_canonical(
+                provenance(&model_source(&a, &model), &quant),
+                a.base_model.as_deref(),
+            )?;
+            let dir = resolve_llama_dir(&a, &["llama-bench", "llama-server"])?;
             eprintln!("\n▸ [2/4] Benchmark — llama-bench (prefill + decode)");
             let b = run_llama_bench(&bench_opts(&a, &dir, &model))?;
             eprintln!(
@@ -742,10 +746,6 @@ fn main() -> Result<()> {
             );
             let (v, ttft) = verify::run_verification_with_ttft(&verify_opts(&a, &dir, &model))?;
             let valid = v.valid;
-            let hf = explicit_canonical(
-                provenance(&model_source(&a, &model), &quant),
-                a.base_model.as_deref(),
-            )?;
             let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft)?;
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
