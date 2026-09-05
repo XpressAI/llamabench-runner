@@ -124,12 +124,21 @@ pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Res
         return Ok(hf);
     };
     let base_model = base_model.trim();
-    let valid = base_model.split_once('/').is_some_and(|(owner, name)| {
-        !owner.is_empty()
-            && !name.is_empty()
-            && !name.contains('/')
-            && !base_model.chars().any(char::is_control)
-    });
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment.len() <= 96
+            && !segment.starts_with(['-', '.'])
+            && !segment.ends_with(['-', '.'])
+            && !segment.contains("--")
+            && !segment.contains("..")
+            && !segment.ends_with(".git")
+            && segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    let valid = base_model
+        .split_once('/')
+        .is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name));
     if !valid {
         bail!("--base-model must be a Hugging Face repo in owner/name form");
     }
@@ -350,6 +359,9 @@ pub struct BuildCtx<'a> {
     /// Explicit llama.cpp device selector (`CUDA1`, UUID, etc.), when supplied. This
     /// keeps per-device properties tied to the GPU that actually ran the benchmark.
     pub selected_device: Option<String>,
+    /// Whether the native configuration distributes work across visible GPUs.
+    /// `--split-mode none` explicitly disables this even when several cards are visible.
+    pub group_visible_gpus: bool,
     pub handle: &'a str,
     pub family: Family,
     /// The exact reproduce command recorded on the result (paths/keys already redacted).
@@ -428,8 +440,12 @@ pub fn build_submission(
     let vram_gb = if vendor == "Apple" {
         detect::apple_unified_mem_gb()
     } else if vendor == "NVIDIA" {
-        if let Some((count, total_gib)) =
-            detect::nvidia_gpu_group(&device, ctx.selected_device.as_deref(), &b.backend_label)
+        if let Some((count, total_gib)) = ctx
+            .group_visible_gpus
+            .then(|| {
+                detect::nvidia_gpu_group(&device, ctx.selected_device.as_deref(), &b.backend_label)
+            })
+            .flatten()
         {
             if count > 1 {
                 device = format!("{count}× {device}");
@@ -669,6 +685,26 @@ mod tests {
         assert!(err
             .to_string()
             .contains("conflicts with repository metadata"));
+
+        for invalid in [
+            "owner/.",
+            "owner/---",
+            "owner/   ",
+            "owner/bad--name",
+            "owner/bad..name",
+            "owner/name.git",
+            "owner/name/extra",
+        ] {
+            let hf = HfProvenance {
+                model: Some("publisher/quantized".to_string()),
+                verified: Some(true),
+                canonical: Canonical::default(),
+            };
+            assert!(
+                explicit_canonical(hf, Some(invalid)).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -241,6 +241,11 @@ fn validate_selected_device_scope(selected: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn group_visible_gpus(args: &[String]) -> bool {
+    !flag_value(args, &["-sm", "--split-mode"])
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
+}
+
 /// Shell-quote a token if needed (for the recorded reproduce command).
 fn shell_quote(s: &str) -> String {
     let plain = !s.is_empty()
@@ -723,6 +728,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
             selected_device: requested_device.clone(),
+            group_visible_gpus: group_visible_gpus(args),
             handle: &w.handle,
             family: w.family,
             command: command.clone(),
@@ -996,6 +1002,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     let ctx = BuildCtx {
         gpu_run,
         selected_device: requested_device,
+        group_visible_gpus: group_visible_gpus(args),
         handle: &w.handle,
         family: w.family,
         command: redacted_command("llama-server", args),
@@ -1145,6 +1152,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("multiple explicit --device"));
+        assert!(group_visible_gpus(&v(&["--split-mode", "layer"])));
+        assert!(group_visible_gpus(&v(&["-sm", "row"])));
+        assert!(!group_visible_gpus(&v(&["--split-mode=none"])));
+        assert!(!group_visible_gpus(&v(&["-sm", "NONE"])));
     }
 
     #[test]

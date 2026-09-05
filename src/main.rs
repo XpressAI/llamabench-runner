@@ -415,6 +415,7 @@ fn classic_ctx<'a>(a: &'a RunArgs, model: &'a str, quant: &'a str) -> BuildCtx<'
     BuildCtx {
         gpu_run: a.ngl != 0,
         selected_device: None,
+        group_visible_gpus: true,
         handle: &a.handle,
         family: a.family,
         command,
