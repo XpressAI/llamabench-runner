@@ -585,6 +585,28 @@ fn validate_model_metadata_scope(
     Ok(())
 }
 
+fn metadata_model_arg(model_arg: &str, w: &WrapOpts) -> Result<Option<String>> {
+    if w.active_params.is_none() && w.base_model.is_none() {
+        return Ok(None);
+    }
+    let mut models = Vec::new();
+    for model in model_arg
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if models.len() != 1 {
+        bail!(
+            "--active-params and --base-model apply to one model; split a multi-model llama-bench matrix into separate commands"
+        );
+    }
+    Ok(models.first().map(|model| (*model).to_string()))
+}
+
 fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     let explicit_model = flag_value(args, &["-m", "--model"]).filter(|v| !v.is_empty());
     if explicit_model.is_none() {
@@ -594,6 +616,19 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     }
     let requested_device = selected_device(args);
     validate_selected_device_scope(requested_device.as_deref())?;
+    let metadata_model = metadata_model_arg(explicit_model.as_deref().unwrap_or_default(), w)?;
+    let prepared_hf = if w.base_model.is_some() {
+        let model = metadata_model
+            .as_deref()
+            .context("--base-model requires one explicit model")?;
+        let quant = submitter::resolved_quant(None, model);
+        Some(submitter::explicit_canonical(
+            submitter::provenance(&ModelSource::LocalOnly(model), &quant),
+            w.base_model.as_deref(),
+        )?)
+    } else {
+        None
+    };
     // Fail fast before a long run when there's nothing to submit with.
     let token = if w.dry_run {
         None
@@ -721,10 +756,13 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             }
         };
         let quant = submitter::resolved_quant(None, &g.model_file);
-        let hf = submitter::explicit_canonical(
-            submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
-            w.base_model.as_deref(),
-        )?;
+        let hf = match &prepared_hf {
+            Some(hf) => hf.clone(),
+            None => submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::LocalOnly(&g.model_file), &quant),
+                w.base_model.as_deref(),
+            )?,
+        };
         let ctx = BuildCtx {
             gpu_run: g.ngl != 0,
             selected_device: requested_device.clone(),
@@ -838,6 +876,38 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
     }
     let requested_device = selected_device(args);
     validate_selected_device_scope(requested_device.as_deref())?;
+    // Resolve deterministic identity/provenance failures before starting and
+    // measuring a potentially long-lived llama-server process.
+    let prepared_model = match (&model_path, &hf_repo_arg) {
+        (Some(m), _) => {
+            let quant = submitter::resolved_quant(None, m);
+            let hf = submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::LocalOnly(m), &quant),
+                w.base_model.as_deref(),
+            )?;
+            let label = hf
+                .canonical
+                .name
+                .clone()
+                .unwrap_or_else(|| submitter::model_name(m));
+            (label, quant, hf)
+        }
+        (None, Some(spec)) => {
+            let (repo, tag) = match spec.split_once(':') {
+                Some((r, t)) => (r.to_string(), Some(t.to_string())),
+                None => (spec.clone(), None),
+            };
+            let label = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+            let quant = tag.unwrap_or_else(|| "unknown".to_string());
+            let hf = submitter::explicit_canonical(
+                submitter::provenance(&ModelSource::Downloaded(&repo), &quant),
+                w.base_model.as_deref(),
+            )?;
+            let label = hf.canonical.name.clone().unwrap_or(label);
+            (label, quant, hf)
+        }
+        (None, None) => unreachable!("guarded above"),
+    };
     let token = if w.dry_run {
         None
     } else {
@@ -915,38 +985,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         }
     };
 
-    // Model identity: a local -m file (link-store provenance), or the server's own
-    // -hf download (repo[:quant] ⇒ trivially verified provenance).
-    let (model_label, quant, hf) = match (&model_path, &hf_repo_arg) {
-        (Some(m), _) => {
-            let quant = submitter::resolved_quant(None, m);
-            let hf = submitter::explicit_canonical(
-                submitter::provenance(&ModelSource::LocalOnly(m), &quant),
-                w.base_model.as_deref(),
-            )?;
-            let label = hf
-                .canonical
-                .name
-                .clone()
-                .unwrap_or_else(|| submitter::model_name(m));
-            (label, quant, hf)
-        }
-        (None, Some(spec)) => {
-            let (repo, tag) = match spec.split_once(':') {
-                Some((r, t)) => (r.to_string(), Some(t.to_string())),
-                None => (spec.clone(), None),
-            };
-            let label = repo.rsplit('/').next().unwrap_or(&repo).to_string();
-            let quant = tag.unwrap_or_else(|| "unknown".to_string());
-            let hf = submitter::explicit_canonical(
-                submitter::provenance(&ModelSource::Downloaded(&repo), &quant),
-                w.base_model.as_deref(),
-            )?;
-            let label = hf.canonical.name.clone().unwrap_or(label);
-            (label, quant, hf)
-        }
-        (None, None) => unreachable!("guarded above"),
-    };
+    let (model_label, quant, hf) = prepared_model;
     let context_length = server_ctx(port, api_key.as_deref())
         .or_else(|| flag_value(args, &["-c", "--ctx-size"]).and_then(|v| v.parse().ok()))
         .filter(|c| *c > 0)
@@ -1117,6 +1156,16 @@ mod tests {
             None
         )
         .is_ok());
+
+        let w = WrapOpts {
+            base_model: Some("owner/model".to_string()),
+            ..WrapOpts::default()
+        };
+        assert_eq!(
+            metadata_model_arg("model.gguf", &w).unwrap().as_deref(),
+            Some("model.gguf")
+        );
+        assert!(metadata_model_arg("one.gguf,two.gguf", &w).is_err());
     }
 
     #[test]

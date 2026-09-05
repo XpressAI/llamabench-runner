@@ -78,7 +78,7 @@ impl Family {
 /// quantizes). Lets every GGUF repack of the same model group together. All fields are
 /// `None` when there's no HF repo or no resolvable `base_model`, in which case the
 /// caller falls back to the per-quant llama-bench label.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Canonical {
     /// The full canonical HF repo, e.g. `google/gemma-4-12b-it`. → `ModelInfo.base_model`.
     pub base_model: Option<String>,
@@ -171,6 +171,7 @@ pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Res
 /// are confirmed to come from it, and the canonical (base/finetune) model identity it
 /// should be attributed to. Maps to `ModelInfo.hf_model` / `hf_verified` / `base_model`
 /// (and the canonical `id`/`name`).
+#[derive(Clone)]
 pub struct HfProvenance {
     pub model: Option<String>,
     pub verified: Option<bool>,

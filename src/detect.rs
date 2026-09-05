@@ -105,6 +105,10 @@ fn nvidia_smi_group(
                     && gpus
                         .iter()
                         .all(|gpu| gpu.name.eq_ignore_ascii_case(device_name.trim()));
+                if unique.len() == 1 && gpus.len() == 1 && homogeneous {
+                    let total_bytes = gpus[0].memory_mib.checked_mul(1024 * 1024)?;
+                    return Some((1, bytes_to_rounded_gib(total_bytes)?, true));
+                }
                 return (!unique.is_empty() && banner_matches).then_some((
                     unique.len(),
                     0,
@@ -533,6 +537,10 @@ mod tests {
         assert_eq!(
             nvidia_smi_group(homogeneous, "CMP 170HX", None),
             Some((2, 128, true))
+        );
+        assert_eq!(
+            nvidia_smi_group("GPU-aaaa, CMP 170HX, 65536\n", "CMP 170HX", Some("0")),
+            Some((1, 64, true))
         );
     }
 
