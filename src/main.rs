@@ -115,6 +115,9 @@ struct SpeedArgs {
     /// Active parameters in billions for a sparse model, when officially disclosed.
     #[arg(long, value_parser = submitter::positive_f64)]
     active_params: Option<f64>,
+    /// Local port used only by the runner's temporary correctness server.
+    #[arg(long, default_value_t = 8080)]
+    verification_port: u16,
     /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
     #[arg(
         last = true,
@@ -428,7 +431,7 @@ fn classic_submission(
     v: Option<Verification>,
     hf: HfProvenance,
     ttft_ms: Option<u32>,
-) -> contract::ResultSubmission {
+) -> Result<contract::ResultSubmission> {
     let mut ctx = classic_ctx(a, model, quant);
     ctx.ttft_ms = ttft_ms;
     build_submission(&ctx, b, v, hf)
@@ -689,6 +692,7 @@ fn main() -> Result<()> {
                     api: a.api,
                     base_model: a.base_model,
                     active_params: a.active_params,
+                    verification_port: a.verification_port,
                 },
                 tool_args,
             );
@@ -702,7 +706,7 @@ fn main() -> Result<()> {
                 provenance(&model_source(&a, &model), &quant),
                 a.base_model.as_deref(),
             )?;
-            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None))?;
+            submitter::emit(&classic_submission(&a, &model, &quant, &b, None, hf, None)?)?;
         }
         Command::Verify(a) => {
             let model = resolve_model(&a)?;
@@ -737,7 +741,7 @@ fn main() -> Result<()> {
                 provenance(&model_source(&a, &model), &quant),
                 a.base_model.as_deref(),
             )?;
-            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft);
+            let mut submission = classic_submission(&a, &model, &quant, &b, Some(v), hf, ttft)?;
             submitter::sign(&mut submission)?;
             submitter::emit(&submission)?;
             if !valid {
@@ -871,6 +875,8 @@ mod tests {
             "ornith-ai/Ornith-1.5-9B",
             "--active-params",
             "3",
+            "--verification-port",
+            "18080",
             "--",
             "llama-server",
             "-m",
@@ -887,6 +893,7 @@ mod tests {
         assert!(matches!(a.family, Family::IkLlamaCpp));
         assert_eq!(a.base_model.as_deref(), Some("ornith-ai/Ornith-1.5-9B"));
         assert_eq!(a.active_params, Some(3.0));
+        assert_eq!(a.verification_port, 18080);
         assert_eq!(a.command[0], "llama-server");
         assert_eq!(
             a.command.last().map(String::as_str),

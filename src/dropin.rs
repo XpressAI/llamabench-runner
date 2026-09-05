@@ -50,6 +50,7 @@ pub struct WrapOpts {
     pub api: String,
     pub base_model: Option<String>,
     pub active_params: Option<f64>,
+    pub verification_port: u16,
 }
 
 impl Default for WrapOpts {
@@ -65,6 +66,7 @@ impl Default for WrapOpts {
             api: submitter::DEFAULT_API.to_string(),
             base_model: None,
             active_params: None,
+            verification_port: 8080,
         }
     }
 }
@@ -124,6 +126,14 @@ fn extract_wrapper_flags(args: &[String]) -> Result<(WrapOpts, Vec<String>)> {
                     submitter::positive_f64(&value)
                         .map_err(|message| anyhow!("--active-params {message}"))?,
                 );
+            }
+            "--verification-port" => {
+                w.verification_port = take_value(args, &mut i, name, inline)?
+                    .parse()
+                    .map_err(|_| anyhow!("--verification-port must be a number from 1 to 65535"))?;
+                if w.verification_port == 0 {
+                    bail!("--verification-port must be a number from 1 to 65535");
+                }
             }
             _ => rest.push(a.clone()),
         }
@@ -649,7 +659,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             match verify::run_verification_with_ttft(&VerifyOpts {
                 server_bin_dir: &dir,
                 model: &g.model_file,
-                port: 8080,
+                port: w.verification_port,
                 api_key: "llamabench",
                 seed: 42,
                 n_gen: 128,
@@ -686,7 +696,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             ttft_ms,
         };
         let invalid = verification.as_ref().is_some_and(|v| !v.valid);
-        let mut s = build_submission(&ctx, &g.bench, verification, hf);
+        let mut s = build_submission(&ctx, &g.bench, verification, hf)?;
         submitter::sign(&mut s)?;
         submitter::emit(&s)?;
         if invalid {
@@ -958,7 +968,7 @@ fn run_server(w: &WrapOpts, args: &[String]) -> Result<()> {
         ttft_ms: Some(speed.prompt_ms.round() as u32),
     };
     let invalid = verification.as_ref().is_some_and(|v| !v.valid);
-    let mut s = build_submission(&ctx, &bench, verification, hf);
+    let mut s = build_submission(&ctx, &bench, verification, hf)?;
     submitter::sign(&mut s)?;
     submitter::emit(&s)?;
     if invalid {
@@ -996,12 +1006,15 @@ mod tests {
             "1",
             "--llama-dir",
             "/opt/llama",
+            "--verification-port",
+            "18080",
         ]))
         .unwrap();
         assert!(w.dry_run);
         assert!(!w.no_verify);
         assert_eq!(w.handle, "@edu");
         assert_eq!(w.llama_dir, "/opt/llama");
+        assert_eq!(w.verification_port, 18080);
         assert!(matches!(w.family, Family::IkLlamaCpp));
         // Only our flags are removed; order and values of the tool's args survive.
         assert_eq!(rest, v(&["-m", "/x/m.gguf", "-ngl", "99", "-fa", "1"]));
@@ -1011,6 +1024,7 @@ mod tests {
                 extract_wrapper_flags(&v(&["--active-params", invalid, "-m", "m.gguf"])).is_err()
             );
         }
+        assert!(extract_wrapper_flags(&v(&["--verification-port", "0", "-m", "m.gguf"])).is_err());
     }
 
     #[test]

@@ -136,6 +136,14 @@ pub fn explicit_canonical(mut hf: HfProvenance, base_model: Option<&str>) -> Res
     if hf.model.is_none() {
         bail!("--base-model requires Hugging Face GGUF provenance (link the local file first, or pass --hf-model)");
     }
+    if let Some(authoritative) = hf.canonical.base_model.as_deref() {
+        if !authoritative.eq_ignore_ascii_case(base_model) {
+            bail!(
+                "--base-model {base_model} conflicts with repository metadata base_model {authoritative}"
+            );
+        }
+        return Ok(hf);
+    }
     let (id, name) = canonical_id_name(base_model);
     eprintln!(
         "→ model: {name} (explicit base of {})",
@@ -354,12 +362,28 @@ pub struct BuildCtx<'a> {
     pub ttft_ms: Option<u32>,
 }
 
+fn validate_active_params(active_params: Option<f64>, total_params: f64) -> Result<()> {
+    let Some(active) = active_params else {
+        return Ok(());
+    };
+    if !active.is_finite() || active <= 0.0 {
+        bail!("active parameters must be a finite number greater than zero");
+    }
+    if total_params.is_finite() && total_params > 0.0 && active > total_params {
+        bail!(
+            "active parameters ({active}B) cannot exceed measured total parameters ({total_params:.3}B)"
+        );
+    }
+    Ok(())
+}
+
 pub fn build_submission(
     ctx: &BuildCtx,
     b: &BenchResult,
     v: Option<Verification>,
     hf: HfProvenance,
-) -> ResultSubmission {
+) -> Result<ResultSubmission> {
+    validate_active_params(ctx.active_params, b.params_b)?;
     // On Apple Silicon the GPU is the chip, and the Metal banner reads noisily as
     // "MTL0 (Apple M4)"; sysctl gives the clean canonical name, so prefer it for GPU runs.
     let mut device = ctx
@@ -418,7 +442,7 @@ pub fn build_submission(
     } else {
         0.0
     };
-    ResultSubmission {
+    Ok(ResultSubmission {
         schema_version: SCHEMA_VERSION,
         hardware: Hardware {
             id: detect::slugify(&device),
@@ -465,7 +489,7 @@ pub fn build_submission(
             handle: ctx.handle.to_string(),
         },
         signature: String::new(),
-    }
+    })
 }
 
 pub fn emit(s: &ResultSubmission) -> Result<()> {
@@ -629,6 +653,22 @@ mod tests {
             resolved.canonical.base_model.as_deref(),
             Some("ornith-ai/Ornith-1.5-9B")
         );
+
+        let authoritative = HfProvenance {
+            model: Some("publisher/quantized".to_string()),
+            verified: Some(true),
+            canonical: Canonical {
+                base_model: Some("publisher/canonical".to_string()),
+                id: Some("canonical".to_string()),
+                name: Some("canonical".to_string()),
+            },
+        };
+        let err = explicit_canonical(authoritative, Some("attacker/unrelated"))
+            .err()
+            .expect("conflicting repository metadata must win");
+        assert!(err
+            .to_string()
+            .contains("conflicts with repository metadata"));
     }
 
     #[test]
@@ -675,5 +715,18 @@ mod tests {
         // "3.1" (version) must not be read as a size; "8B" wins.
         assert_eq!(params_from_name("Meta-Llama-3.1-8B"), 8.0);
         assert_eq!(params_from_name("mystery-model"), 0.0);
+    }
+
+    #[test]
+    fn active_params_cannot_exceed_measured_total() {
+        assert!(validate_active_params(Some(3.0), 35.0).is_ok());
+        assert!(validate_active_params(Some(40.0), 35.0)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot exceed"));
+        // Server-mode filename heuristics may not recover a total; retain the
+        // positive/finite validation but defer the upper bound when total is unknown.
+        assert!(validate_active_params(Some(3.0), 0.0).is_ok());
+        assert!(validate_active_params(Some(f64::INFINITY), 35.0).is_err());
     }
 }
