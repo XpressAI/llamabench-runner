@@ -85,11 +85,11 @@ fn nvidia_smi_group(
                 if identity.to_ascii_uppercase().starts_with("MIG-") {
                     return None;
                 }
-                let gpu = identity
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| gpus.get(index))
-                    .or_else(|| unique_by_identity(&gpus, identity, |gpu| &gpu.uuid))?;
+                // Numeric CUDA ordinals follow CUDA's enumeration order, which is
+                // not guaranteed to match nvidia-smi's row order. Without a CUDA
+                // runtime identity query, conservatively skip grouping rather than
+                // attribute the wrong physical cards or VRAM capacities.
+                let gpu = unique_by_identity(&gpus, identity, |gpu| &gpu.uuid)?;
                 if !selected.contains(&gpu) {
                     selected.push(gpu);
                 }
@@ -474,10 +474,7 @@ mod tests {
             nvidia_smi_group(output, "CMP 170HX", Some("GPU-bbbb")),
             Some((1, 64))
         );
-        assert_eq!(
-            nvidia_smi_group(output, "CMP 170HX", Some("1,2")),
-            Some((1, 64))
-        );
+        assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("1,2")), None);
         assert_eq!(nvidia_smi_group(output, "NVIDIA H100", None), Some((1, 80)));
         assert_eq!(nvidia_smi_group(output, "NVIDIA A100", None), None);
         assert_eq!(nvidia_smi_group(output, "CMP 170HX", Some("-1")), None);

@@ -14,7 +14,7 @@
 //!
 //! Runner-owned flags (`--dry-run`, `--no-verify`, `--token`, `--handle`,
 //! `--family`, `--llama-dir`, `--api`, `--download-llama`, `--base-model`,
-//! `--active-params`) are extracted before
+//! `--active-params`, `--verification-port`) are extracted before
 //! passthrough; none collide with llama.cpp flag names.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -544,6 +544,24 @@ fn verify_args_for(g: &Group) -> Vec<String> {
     a
 }
 
+fn validate_active_params_scope(groups: &[Group], active_params: Option<f64>) -> Result<()> {
+    let Some(_) = active_params else {
+        return Ok(());
+    };
+    let Some(first_model) = groups.first().map(|group| &group.model_file) else {
+        return Ok(());
+    };
+    if groups
+        .iter()
+        .any(|group| group.model_file.as_str() != first_model.as_str())
+    {
+        bail!(
+            "--active-params applies to one model; split a multi-model llama-bench matrix into separate commands"
+        );
+    }
+    Ok(())
+}
+
 fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
     let explicit_model = flag_value(args, &["-m", "--model"]).filter(|v| !v.is_empty());
     if explicit_model.is_none() {
@@ -608,6 +626,7 @@ fn run_bench(w: &WrapOpts, args: &[String]) -> Result<()> {
             skipped_rows: 0,
         });
     }
+    validate_active_params_scope(&groups, w.active_params)?;
 
     // Some banners enumerate every installed GPU rather than only the selected one.
     // Ask the exact binary for its labelled devices whenever selection is explicit,
@@ -1025,6 +1044,31 @@ mod tests {
             );
         }
         assert!(extract_wrapper_flags(&v(&["--verification-port", "0", "-m", "m.gguf"])).is_err());
+    }
+
+    #[test]
+    fn active_params_reject_multi_model_matrices() {
+        let group = |model_file: &str| Group {
+            bench: BenchResult::default(),
+            context_length: 512,
+            ngl: -1,
+            threads: None,
+            model_file: model_file.to_string(),
+            skipped_rows: 0,
+        };
+        assert!(
+            validate_active_params_scope(&[group("moe.gguf"), group("moe.gguf")], Some(3.0))
+                .is_ok()
+        );
+        assert!(
+            validate_active_params_scope(&[group("moe.gguf"), group("dense.gguf")], Some(3.0))
+                .unwrap_err()
+                .to_string()
+                .contains("split a multi-model")
+        );
+        assert!(
+            validate_active_params_scope(&[group("moe.gguf"), group("dense.gguf")], None).is_ok()
+        );
     }
 
     #[test]
