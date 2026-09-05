@@ -113,7 +113,7 @@ struct SpeedArgs {
     #[arg(long)]
     base_model: Option<String>,
     /// Active parameters in billions for a sparse model, when officially disclosed.
-    #[arg(long, value_parser = positive_f64)]
+    #[arg(long, value_parser = submitter::positive_f64)]
     active_params: Option<f64>,
     /// Native command and arguments: `llama-bench ...` or `llama-server ...`.
     #[arg(
@@ -179,7 +179,7 @@ struct RunArgs {
     #[arg(long)]
     base_model: Option<String>,
     /// Active parameters in billions for a sparse model, when officially disclosed.
-    #[arg(long, value_parser = positive_f64)]
+    #[arg(long, value_parser = submitter::positive_f64)]
     active_params: Option<f64>,
     /// Quantization, e.g. Q4_K_M. Required with --hf-model (selects the .gguf to fetch).
     /// The recorded quant is read from the actual file name (so variants like
@@ -309,17 +309,6 @@ fn bench_opts<'a>(a: &'a RunArgs, llama_dir: &'a str, model: &'a str) -> BenchOp
         ctv: &a.ctv,
         n_prompt: a.n_prompt,
         n_gen: a.n_gen,
-    }
-}
-
-fn positive_f64(value: &str) -> std::result::Result<f64, String> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_| "must be a number".to_string())?;
-    if parsed.is_finite() && parsed > 0.0 {
-        Ok(parsed)
-    } else {
-        Err("must be a finite number greater than zero".to_string())
     }
 }
 
@@ -478,6 +467,12 @@ fn eval_model_file(model: &str) -> Result<String> {
     Ok(model_file.to_string())
 }
 
+#[derive(Clone, Copy, Default)]
+struct EvalReproProvenance<'a> {
+    hf_model: Option<&'a str>,
+    base_model: Option<&'a str>,
+}
+
 fn eval_command(
     a: &EvalArgs,
     model: &str,
@@ -485,6 +480,7 @@ fn eval_command(
     context_length: u32,
     parallel: u32,
     runtime_args: &[String],
+    provenance: EvalReproProvenance<'_>,
 ) -> Result<String> {
     let reproduce_context = context_length
         .checked_mul(parallel)
@@ -503,10 +499,10 @@ fn eval_command(
         "--context-length".to_string(),
         reproduce_context.to_string(),
     ];
-    if let Some(hf_model) = a.hf_model.as_deref() {
+    if let Some(hf_model) = provenance.hf_model {
         parts.extend(["--hf-model".to_string(), shell_word(hf_model)]);
     }
-    if let Some(base_model) = a.base_model.as_deref() {
+    if let Some(base_model) = provenance.base_model {
         parts.extend(["--base-model".to_string(), shell_word(base_model)]);
     }
     if a.family != Family::LlamaCpp {
@@ -559,6 +555,10 @@ fn eval_submission(
         context_length,
         runtime.parallel,
         &runtime.args,
+        EvalReproProvenance {
+            hf_model: hf_model.as_deref(),
+            base_model: base_model.as_deref(),
+        },
     )?;
     if command.chars().count() > 8_000 {
         bail!("eval-v2 reproduce command exceeds 8000 characters");
@@ -948,6 +948,10 @@ mod tests {
             262_144,
             runtime.parallel,
             &runtime.args,
+            EvalReproProvenance {
+                hf_model: a.hf_model.as_deref(),
+                base_model: a.base_model.as_deref(),
+            },
         )
         .unwrap();
         assert!(command.contains("eval --model ./model-Q4_K_M.gguf"));
@@ -1028,6 +1032,7 @@ mod tests {
             262_144,
             runtime.parallel,
             &runtime.args,
+            EvalReproProvenance::default(),
         )
         .unwrap();
         assert!(command.contains("--context-length 524288 -- -np 2"));

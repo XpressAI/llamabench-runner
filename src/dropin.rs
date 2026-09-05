@@ -120,7 +120,10 @@ fn extract_wrapper_flags(args: &[String]) -> Result<(WrapOpts, Vec<String>)> {
             "--base-model" => w.base_model = Some(take_value(args, &mut i, name, inline)?),
             "--active-params" => {
                 let value = take_value(args, &mut i, name, inline)?;
-                w.active_params = Some(value.parse().context("--active-params must be a number")?);
+                w.active_params = Some(
+                    submitter::positive_f64(&value)
+                        .map_err(|message| anyhow!("--active-params {message}"))?,
+                );
             }
             _ => rest.push(a.clone()),
         }
@@ -1002,6 +1005,12 @@ mod tests {
         assert!(matches!(w.family, Family::IkLlamaCpp));
         // Only our flags are removed; order and values of the tool's args survive.
         assert_eq!(rest, v(&["-m", "/x/m.gguf", "-ngl", "99", "-fa", "1"]));
+
+        for invalid in ["-1", "0", "NaN", "inf"] {
+            assert!(
+                extract_wrapper_flags(&v(&["--active-params", invalid, "-m", "m.gguf"])).is_err()
+            );
+        }
     }
 
     #[test]

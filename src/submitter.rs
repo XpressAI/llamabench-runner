@@ -20,6 +20,17 @@ use crate::link;
 pub const DEFAULT_API: &str = "https://llamabench.ai/api/results";
 pub const DEFAULT_EVAL_API: &str = "https://llamabench.ai/api/evals";
 
+pub fn positive_f64(value: &str) -> std::result::Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| "must be a number".to_string())?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err("must be a finite number greater than zero".to_string())
+    }
+}
+
 /// Which llama.cpp variant a build is from. They share the `llama-bench` /
 /// `llama-server` CLI, so the runner drives them identically — but results are
 /// recorded under the variant's name so they stay comparable yet distinct.
